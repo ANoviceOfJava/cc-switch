@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -256,7 +256,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
             _ => continue,
         };
 
-        if content.trim().is_empty() {
+        if content.trim().is_empty() || (role == "user" && is_internal_context_message(&content)) {
             continue;
         }
 
@@ -266,6 +266,167 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     }
 
     Ok(messages)
+}
+
+/// 返回与 `load_messages` 顺序一致的用户消息非文本附件数据。
+pub fn load_message_attachments(path: &Path) -> Result<Vec<Option<String>>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open session file: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut attachments = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let (role, content) = match payload_type {
+            "message" => (
+                payload
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                payload.get("content").map(extract_text).unwrap_or_default(),
+            ),
+            "function_call" => ("assistant", "[Tool]".to_string()),
+            "function_call_output" => (
+                "tool",
+                payload
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            _ => continue,
+        };
+        if content.trim().is_empty() || (role == "user" && is_internal_context_message(&content)) {
+            continue;
+        }
+        let detail = (role == "user")
+            .then(|| payload.get("content"))
+            .flatten()
+            .and_then(non_text_message_content);
+        attachments.push(detail);
+    }
+
+    Ok(attachments)
+}
+
+fn non_text_message_content(content: &Value) -> Option<String> {
+    let values = content
+        .as_array()?
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_text" | "text")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!values.is_empty())
+        .then(|| serde_json::to_string(&values).ok())
+        .flatten()
+}
+
+/// 返回会话文件尾部最后一条用户或助手消息的时间。
+pub fn latest_message_timestamp(path: &Path) -> Option<i64> {
+    find_latest_json_record(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            return None;
+        }
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) != Some("message") {
+            return None;
+        }
+        match payload.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                let content = payload.get("content").map(extract_text).unwrap_or_default();
+                if is_internal_context_message(&content) {
+                    None
+                } else {
+                    value.get("timestamp").and_then(parse_timestamp_to_ms)
+                }
+            }
+            Some("assistant") => value.get("timestamp").and_then(parse_timestamp_to_ms),
+            _ => None,
+        }
+    })
+}
+
+/// 返回会话最近一次实际使用的模型和推理强度。
+pub fn latest_thread_settings(path: &Path) -> (Option<String>, Option<String>) {
+    find_latest_json_record(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("turn_context") {
+            return None;
+        }
+        let payload = value.get("payload")?;
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let effort = payload
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        (model.is_some() || effort.is_some()).then_some((model, effort))
+    })
+    .unwrap_or((None, None))
+}
+
+/// 返回会话最近一次模型请求实际占用的上下文 Token 数和模型上下文窗口。
+pub fn latest_thread_context_usage(path: &Path) -> Option<(u64, u64)> {
+    find_latest_json_record(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return None;
+        }
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            return None;
+        }
+        let info = payload.get("info")?;
+        let used_tokens = info
+            .pointer("/last_token_usage/total_tokens")
+            .and_then(Value::as_u64)?;
+        let model_context_window = info.get("model_context_window").and_then(Value::as_u64)?;
+        (model_context_window > 0).then_some((used_tokens, model_context_window))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadExecutionState {
+    Active,
+    Idle,
+}
+
+/// 返回会话文件中最近一次任务生命周期事件对应的执行状态。
+pub fn latest_thread_execution_state(path: &Path) -> Option<ThreadExecutionState> {
+    find_latest_json_record(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return None;
+        }
+        match value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("task_started") => Some(ThreadExecutionState::Active),
+            Some("task_complete") => Some(ThreadExecutionState::Idle),
+            _ => None,
+        }
+    })
 }
 
 pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
@@ -424,10 +585,7 @@ fn is_subagent_source(source: Option<&Value>) -> bool {
 
 fn title_candidate_from_user_message(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with("# AGENTS.md")
-        || trimmed.starts_with("<environment_context>")
-    {
+    if trimmed.is_empty() || is_internal_context_message(trimmed) {
         return None;
     }
 
@@ -436,6 +594,11 @@ fn title_candidate_from_user_message(text: &str) -> Option<String> {
     }
 
     Some(trimmed.to_string())
+}
+
+fn is_internal_context_message(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md") || trimmed.starts_with("<environment_context>")
 }
 
 fn extract_codex_prompt_from_ide_context(text: &str) -> Option<String> {
@@ -519,6 +682,37 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) {
             files.push(path);
         }
     }
+}
+
+fn find_latest_json_record<T>(
+    path: &Path,
+    mut matcher: impl FnMut(&Value) -> Option<T>,
+) -> Option<T> {
+    let mut file = File::open(path).ok()?;
+    let mut position = file.metadata().ok()?.len();
+    let mut leading_fragment = Vec::new();
+    while position > 0 {
+        let chunk_len = position.min(64 * 1024) as usize;
+        position -= chunk_len as u64;
+        file.seek(SeekFrom::Start(position)).ok()?;
+        let mut chunk = vec![0; chunk_len];
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend_from_slice(&leading_fragment);
+
+        let lines = chunk.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let scan_from = usize::from(position > 0);
+        for line in lines[scan_from..].iter().rev() {
+            let line = std::str::from_utf8(line).ok()?;
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(result) = matcher(&value) {
+                return Some(result);
+            }
+        }
+        leading_fragment = lines.first().copied().unwrap_or_default().to_vec();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -993,5 +1187,170 @@ mod tests {
 
         assert_eq!(msgs[3].role, "assistant");
         assert_eq!(msgs[3].content, "Done.");
+    }
+
+    #[test]
+    fn load_messages_skips_codex_internal_context() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"# AGENTS.md instructions\\n<INSTRUCTIONS>Do stuff</INSTRUCTIONS>\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:14Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"<environment_context>\\n  <cwd>/tmp/project</cwd>\\n</environment_context>\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:15Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"Fix the login bug\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:16Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"Done.\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        let msgs = load_messages(&path).expect("load");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "Fix the login bug");
+        assert_eq!(msgs[1].content, "Done.");
+    }
+
+    #[test]
+    fn latest_message_timestamp_ignores_later_non_message_events() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:16Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"done\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:51:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(latest_message_timestamp(&path), Some(1_772_833_816_000));
+    }
+
+    #[test]
+    fn latest_message_timestamp_ignores_internal_context() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:16Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"done\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:51:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"<environment_context>\\n  <cwd>/tmp/project</cwd>\\n</environment_context>\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(latest_message_timestamp(&path), Some(1_772_833_816_000));
+    }
+
+    #[test]
+    fn latest_thread_settings_uses_last_turn_context() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-old\",\"effort\":\"low\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"done\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-current\",\"effort\":\"high\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            latest_thread_settings(&path),
+            (Some("gpt-current".to_string()), Some("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn latest_thread_settings_finds_context_before_large_tail() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        let large_tail = "x".repeat(100_000);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-current\",\"effort\":\"medium\"}}}}\n{{\"type\":\"response_item\",\"payload\":{{\"content\":\"{large_tail}\"}}}}\n"
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            latest_thread_settings(&path),
+            (Some("gpt-current".to_string()), Some("medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn latest_thread_context_usage_reads_last_complete_token_count() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":1200},\"model_context_window\":10000}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":3400},\"model_context_window\":20000}}}\n"
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(latest_thread_context_usage(&path), Some((3400, 20000)));
+    }
+
+    #[test]
+    fn load_message_attachments_aligns_with_visible_messages() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"查看图片\"},{\"type\":\"localImage\",\"path\":\"C:/tmp/design.png\"}]}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"完成\"}}\n"
+            ),
+        )
+        .expect("write");
+
+        let attachments = load_message_attachments(&path).expect("load attachments");
+        assert_eq!(attachments.len(), 2);
+        assert!(attachments[0]
+            .as_deref()
+            .is_some_and(|value| value.contains("design.png")));
+        assert!(attachments[1].is_none());
+    }
+
+    #[test]
+    fn latest_thread_execution_state_uses_last_lifecycle_event() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_reasoning\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            latest_thread_execution_state(&path),
+            Some(ThreadExecutionState::Idle)
+        );
+
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}\n",
+            ),
+        )
+        .expect("write");
+
+        assert_eq!(
+            latest_thread_execution_state(&path),
+            Some(ThreadExecutionState::Active)
+        );
     }
 }

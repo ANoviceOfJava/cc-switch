@@ -354,6 +354,27 @@ export interface RemoteSnapshotInfo {
 
 // 应用设置类型（用于设置对话框与 Tauri API）
 // 存储在本地 ~/.cc-switch/settings.json，不随数据库同步
+export type RemoteControlStatus =
+  | "disabled"
+  | "connecting"
+  | "online"
+  | "error";
+
+export interface RemoteControlSettings {
+  enabled: boolean;
+  relayUrl: string;
+  hasAccessKey: boolean;
+  status: RemoteControlStatus;
+  lastError?: string;
+}
+
+export interface RemoteControlSettingsInput {
+  enabled: boolean;
+  relayUrl: string;
+  /** 留空或省略时保留电脑上已经保存的 Access Key。 */
+  accessKey?: string;
+}
+
 export interface Settings {
   // ===== 设备级 UI 设置 =====
   // 是否在系统托盘（macOS 菜单栏）显示图标

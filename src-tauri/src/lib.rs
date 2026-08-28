@@ -30,6 +30,7 @@ mod prompt;
 mod prompt_files;
 mod provider;
 mod proxy;
+mod remote_control;
 mod services;
 mod session_manager;
 mod settings;
@@ -1131,6 +1132,13 @@ pub fn run() {
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
 
+            // Remote 配置只保存在当前电脑；启用后随 CC Switch 自动恢复代理。
+            let remote_control_state = remote_control::RemoteControlState::new();
+            app.manage(remote_control_state.clone());
+            tauri::async_runtime::spawn(async move {
+                remote_control_state.start_saved().await;
+            });
+
             // 初始化 SkillService
             let skill_service = SkillService::new();
             app.manage(commands::skill::SkillServiceState(Arc::new(skill_service)));
@@ -1395,6 +1403,10 @@ pub fn run() {
             commands::read_live_provider_settings,
             commands::get_settings,
             commands::save_settings,
+            remote_control::commands::get_remote_control_settings,
+            remote_control::commands::save_remote_control_settings,
+            remote_control::commands::generate_remote_access_key,
+            remote_control::commands::get_remote_access_key,
             commands::has_codex_unify_history_backup,
             commands::restore_codex_unified_history,
             commands::get_rectifier_config,

@@ -4,6 +4,8 @@ import type {
   WebDavSyncSettings,
   S3SyncSettings,
   RemoteSnapshotInfo,
+  RemoteControlSettings,
+  RemoteControlSettingsInput,
 } from "@/types";
 import type { AppId } from "./types";
 
@@ -37,6 +39,24 @@ export const settingsApi = {
 
   async save(settings: Settings): Promise<boolean> {
     return await invoke("save_settings", { settings });
+  },
+
+  async getRemoteControlSettings(): Promise<RemoteControlSettings> {
+    return await invoke("get_remote_control_settings");
+  },
+
+  async saveRemoteControlSettings(
+    settings: RemoteControlSettingsInput,
+  ): Promise<RemoteControlSettings> {
+    return await invoke("save_remote_control_settings", { settings });
+  },
+
+  async generateRemoteAccessKey(): Promise<string> {
+    return await invoke("generate_remote_access_key");
+  },
+
+  async getRemoteAccessKey(): Promise<string> {
+    return await invoke("get_remote_access_key");
   },
 
   /** 是否存在统一 Codex 会话历史的迁移备份（关闭弹窗据此显示"恢复备份"勾选） */

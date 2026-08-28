@@ -1570,7 +1570,40 @@ fn push_env_codex_cli_candidates(candidates: &mut Vec<PathBuf>, seen: &mut HashS
     }
 }
 
-fn codex_cli_candidates() -> Vec<PathBuf> {
+#[cfg(windows)]
+fn push_windows_codex_cli_candidates(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<String>) {
+    // GUI-launched Tauri processes may not inherit the WindowsApps PATH alias
+    // that is available in an interactive PowerShell. Discover the installed
+    // Microsoft Store package directly so `codex app-server` can still start.
+    let Some(program_files) = std::env::var_os("ProgramFiles") else {
+        return;
+    };
+    let windows_apps = PathBuf::from(program_files).join("WindowsApps");
+    let Ok(entries) = fs::read_dir(windows_apps) else {
+        return;
+    };
+
+    let mut package_dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OpenAI.Codex_"))
+        })
+        .collect::<Vec<_>>();
+    package_dirs.sort_by(|left, right| right.cmp(left));
+
+    for package_dir in package_dirs {
+        push_existing_codex_cli_candidate(
+            candidates,
+            seen,
+            package_dir.join("app").join("resources").join("codex.exe"),
+        );
+    }
+}
+
+pub(crate) fn codex_cli_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1580,6 +1613,8 @@ fn codex_cli_candidates() -> Vec<PathBuf> {
 
     push_env_codex_cli_candidates(&mut candidates, &mut seen);
     push_home_codex_cli_candidates(&mut candidates, &mut seen, &get_home_dir());
+    #[cfg(windows)]
+    push_windows_codex_cli_candidates(&mut candidates, &mut seen);
 
     candidates
 }
