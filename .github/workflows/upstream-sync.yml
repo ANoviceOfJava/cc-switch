@@ -1,0 +1,46 @@
+name: Sync upstream CC Switch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Merge official upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/farion1231/cc-switch.git
+          git fetch upstream main
+          git checkout -B automation/upstream-sync main
+          git merge --no-edit upstream/main
+
+      - name: Open update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push --force-with-lease origin automation/upstream-sync
+          if gh pr view automation/upstream-sync --json state --jq '.state' 2>/dev/null | grep -q OPEN; then
+            exit 0
+          fi
+          if git diff --quiet main automation/upstream-sync; then
+            exit 0
+          fi
+          gh pr create \
+            --base main \
+            --head automation/upstream-sync \
+            --title "chore: sync official CC Switch updates" \
+            --body "自动同步 farion1231/cc-switch 的 main 分支。请检查定制远程控制功能的兼容性后合并。"
