@@ -1427,11 +1427,11 @@ impl AgentRuntime {
         thread_id: &str,
         pinned: bool,
     ) -> Result<(), RemoteAgentError> {
+        // 新建任务在 App Server 的 thread/start 成功后，可能还未及时出现在
+        // thread/list 索引中。这里仍以 App Server 的 thread/resume 结果作为
+        // 最终校验，否则手机端会在创建成功后立刻发送时被误判为不存在。
         if !self.thread_summaries.contains_key(thread_id) {
-            self.build_snapshot().await?;
-        }
-        if !self.thread_summaries.contains_key(thread_id) {
-            return Err(RemoteAgentError::ThreadNotFound(thread_id.to_string()));
+            let _ = self.build_snapshot().await;
         }
         set_thread_pinned(thread_id, pinned)?;
         self.send_snapshot_silent().await
