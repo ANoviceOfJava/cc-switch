@@ -93,6 +93,8 @@ struct AgentRuntime {
     pending_approvals: HashMap<String, PendingApproval>,
     last_detail_thread_id: Option<String>,
     last_snapshot: Option<StateSnapshotDto>,
+    /// 桌面端自动化发送后、会话文件尚未落盘期间的乐观消息。
+    pending_user_messages: HashMap<String, Vec<ConversationItemDto>>,
 }
 
 #[derive(Clone)]
@@ -281,7 +283,7 @@ struct ThreadDetailDto {
     next_before: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConversationItemDto {
     id: String,
@@ -318,7 +320,7 @@ enum ConversationStatus {
     Interrupted,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalOptionDto {
     id: ApprovalDecisionDto,
@@ -379,6 +381,7 @@ impl RemoteControlAgent {
             pending_approvals: HashMap::new(),
             last_detail_thread_id: None,
             last_snapshot: None,
+            pending_user_messages: HashMap::new(),
         };
         let relay_status = runtime.relay.clone();
         let task = tokio::spawn(runtime.run(shutdown_rx));
@@ -1182,8 +1185,8 @@ impl AgentRuntime {
         if let Some((items, local_model, local_effort, local_context_usage)) =
             load_local_thread_detail(thread_id)
         {
-            let (items, has_more_before, next_before) =
-                paginate_conversation_items(items, before, limit);
+            let items = self.merge_pending_user_messages(thread_id, items);
+            let (items, has_more_before, next_before) = paginate_conversation_items(items, before, limit);
             let settings = self.thread_settings.get(thread_id);
             let detail = ThreadDetailDto {
                 revision: Uuid::new_v4().to_string(),
@@ -1229,6 +1232,7 @@ impl AgentRuntime {
             .find(|turn| matches!(turn.status, TurnStatus::InProgress))
             .map(|turn| turn.id.clone());
         let mut items = normalize_conversation_items(&raw_thread.turns);
+        items = self.merge_pending_user_messages(thread_id, items);
         append_pending_approvals(&mut items, thread_id, &self.pending_approvals);
         let (items, has_more_before, next_before) =
             paginate_conversation_items(items, before, limit);
@@ -1258,6 +1262,32 @@ impl AgentRuntime {
         self.send_thread_detail_payload(thread_id, payload).await?;
         self.last_detail_thread_id = Some(thread_id.to_string());
         Ok(())
+    }
+
+    /// 将桌面端尚未落盘的手机消息合并到会话详情，避免刷新时乐观气泡消失。
+    fn merge_pending_user_messages(
+        &mut self,
+        thread_id: &str,
+        mut items: Vec<ConversationItemDto>,
+    ) -> Vec<ConversationItemDto> {
+        let Some(mut pending) = self.pending_user_messages.remove(thread_id) else {
+            return items;
+        };
+        let persisted_texts: HashSet<String> = items
+            .iter()
+            .filter(|item| matches!(item.kind, ConversationKind::UserMessage))
+            .filter_map(|item| item.text.clone())
+            .collect();
+        pending.retain(|item| {
+            item.text
+                .as_ref()
+                .is_none_or(|text| !persisted_texts.contains(text))
+        });
+        items.extend(pending.iter().cloned());
+        if !pending.is_empty() {
+            self.pending_user_messages.insert(thread_id.to_string(), pending);
+        }
+        items
     }
 
     async fn send_thread_detail_payload(
@@ -1368,6 +1398,15 @@ impl AgentRuntime {
                 .await;
             return Err(error.into());
         }
+        // App Server 的 thread/start 成功后，thread/list 可能短暂尚未返回新任务。
+        // 等待它进入内存索引，避免前端收到创建确认后立刻发送 turn.start 却被误判为不存在。
+        for _ in 0..10 {
+            self.build_snapshot().await?;
+            if self.thread_summaries.contains_key(thread_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         self.send_snapshot_silent().await?;
         self.relay
             .send(WireMessage::outbound(
@@ -1468,8 +1507,24 @@ impl AgentRuntime {
             })
             .await
             .map_err(|error| RemoteAgentError::Incompatible(format!("桌面端发送任务中断: {error}")))??;
+            // 先写入乐观消息；桌面端 JSONL 可能在 UI 提交后数秒才落盘。
+            self.pending_user_messages
+                .entry(thread_id.to_string())
+                .or_default()
+                .push(ConversationItemDto {
+                    id: format!("remote-pending-{}", Uuid::new_v4()),
+                    kind: ConversationKind::UserMessage,
+                    status: Some(ConversationStatus::Running),
+                    title: None,
+                    text: Some(desktop_text.clone()),
+                    detail: None,
+                    created_at: Some(unix_time_millis()),
+                    approval_request_id: None,
+                    approval_options: Vec::new(),
+                });
+            self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE).await?;
             let mut confirmed = false;
-            for _ in 0..10 {
+            for _ in 0..20 {
                 if load_local_thread_detail(thread_id).is_some_and(|(items, _, _, _)| {
                     items.iter().any(|item| {
                         matches!(item.kind, ConversationKind::UserMessage)
@@ -1482,6 +1537,7 @@ impl AgentRuntime {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if !confirmed {
+                self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE).await?;
                 return Err(RemoteAgentError::DesktopControl(DesktopControlError(
                     "桌面端未确认消息已写入该会话".to_string(),
                 )));
