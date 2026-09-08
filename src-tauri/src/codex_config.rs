@@ -6824,6 +6824,38 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
+    fn vision_bridge_marker_forces_catalog_image_without_changing_stored_modalities() {
+        let mut settings = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputModalities": ["text"]
+                    }
+                ]
+            }
+        });
+
+        assert!(apply_codex_vision_bridge_catalog_marker(&mut settings, true));
+        let specs = codex_catalog_model_specs(&settings);
+        assert_eq!(
+            specs[0].input_modalities,
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(
+            settings["modelCatalog"]["models"][0]["inputModalities"],
+            json!(["text"])
+        );
+
+        assert!(apply_codex_vision_bridge_catalog_marker(&mut settings, false));
+        let specs = codex_catalog_model_specs(&settings);
+        assert_eq!(
+            specs[0].input_modalities,
+            Some(vec!["text".to_string()])
+        );
+    }
+
+    #[test]
     fn codex_model_catalog_uses_provider_models_and_context() {
         let template = json!({
             "slug": "gpt-5.5",

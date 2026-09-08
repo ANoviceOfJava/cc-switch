@@ -644,7 +644,11 @@ pub async fn set_rectifier_config(
         .db
         .set_rectifier_config(&config)
         .map_err(|e| e.to_string())?;
-    sync_codex_vision_bridge_catalog_markers(&state.db, config.vision_bridge.enabled)
+    let bridge_configured = config.vision_bridge.enabled
+        && !config.vision_bridge.api_url.trim().is_empty()
+        && !config.vision_bridge.api_key.trim().is_empty()
+        && !config.vision_bridge.model.trim().is_empty();
+    sync_codex_vision_bridge_catalog_markers(&state.db, bridge_configured)
         .map_err(|e| e.to_string())?;
     Ok(true)
 }

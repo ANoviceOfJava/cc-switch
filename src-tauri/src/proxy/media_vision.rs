@@ -78,19 +78,18 @@ fn collect_direct_image_refs(body: &Value) -> Vec<DirectImageRef> {
 
 fn collect_responses_image_refs(body: &Value, refs: &mut Vec<DirectImageRef>) {
     let input = match body.get("input") {
-        Some(Value::Array(items)) => items.iter().collect::<Vec<_>>(),
-        Some(item @ Value::Object(_)) => vec![item],
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item, format!("/input/{index}")))
+            .collect::<Vec<_>>(),
+        Some(item @ Value::Object(_)) => vec![(item, "/input".to_string())],
         _ => return,
     };
 
-    for (item_index, item) in input.iter().enumerate() {
+    for (item, base_path) in &input {
         if item.get("type").and_then(Value::as_str) == Some("input_image") {
-            collect_content_image_ref(
-                refs,
-                item,
-                &format!("/input/{item_index}"),
-                "input_text",
-            );
+            collect_content_image_ref(refs, item, base_path, "input_text");
         }
 
         if let Some(content) = item.get("content").and_then(Value::as_array) {
@@ -98,7 +97,7 @@ fn collect_responses_image_refs(body: &Value, refs: &mut Vec<DirectImageRef>) {
                 collect_content_image_ref(
                     refs,
                     block,
-                    &format!("/input/{item_index}/content/{block_index}"),
+                    &format!("{base_path}/content/{block_index}"),
                     "input_text",
                 );
             }
@@ -154,7 +153,9 @@ fn collect_gemini_image_refs(body: &Value, refs: &mut Vec<DirectImageRef>) {
 
 fn gemini_image_url(part: &Value) -> Option<String> {
     for key in ["inlineData", "inline_data", "fileData", "file_data"] {
-        let payload = part.get(key)?;
+        let Some(payload) = part.get(key) else {
+            continue;
+        };
         let mime_type = payload
             .get("mimeType")
             .or_else(|| payload.get("mime_type"))
@@ -184,12 +185,12 @@ fn replace_image_refs_with_results(
 ) -> usize {
     let count = refs.len().min(results.len());
     let mut replaced = 0;
-    for (image, result) in refs.iter().zip(results.iter()).take(count) {
+    for (index, (image, result)) in refs.iter().zip(results.iter()).take(count).enumerate() {
         let Some(block) = body.pointer_mut(&image.path) else {
             continue;
         };
         let fallback = if result.ok {
-            format!("[图片 {} 识别结果]\n{}", replaced + 1, result.text.trim())
+            format!("[图片 {} 识别结果]\n{}", index + 1, result.text.trim())
         } else if successful > 0 {
             FAILED_MARKER.to_string()
         } else {

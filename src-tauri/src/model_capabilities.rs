@@ -132,6 +132,18 @@ fn declared_model_image_support_in_value(value: &Value, model: &str) -> Option<b
 }
 
 fn explicit_image_support(entry: &Value) -> Option<bool> {
+    if entry
+        .get("ccSwitchVisionBridge")
+        .or_else(|| entry.get("cc_switch_vision_bridge"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        // The catalog declares image input only because cc-switch will bridge
+        // it through an external vision model; the upstream model itself is
+        // still treated as text-only during request rectification.
+        return Some(false);
+    }
+
     if let Some(value) = entry
         .get("supportsImage")
         .or_else(|| entry.get("supports_image"))
@@ -273,6 +285,26 @@ mod tests {
         );
         assert_eq!(
             image_input_capability_from_settings(&settings, "text", true),
+            ImageInputCapability::Unsupported
+        );
+    }
+
+    #[test]
+    fn vision_bridge_marker_keeps_upstream_text_only_for_proxy() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "relay-model",
+                        "inputModalities": ["text"],
+                        "ccSwitchVisionBridge": true
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            image_input_capability_from_settings(&settings, "relay-model", true),
             ImageInputCapability::Unsupported
         );
     }
