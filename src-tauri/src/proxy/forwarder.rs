@@ -217,6 +217,34 @@ impl RequestForwarder {
         replaced_images
     }
 
+    /// 预防式 media 整流：优先用配置的多模态接口识别图片，剩余图片再走
+    /// 原有 `[Unsupported Image]` 降级，保证对话在识别服务不可用时也不中断。
+    async fn apply_media_rectifier(&self, body: &mut Value, provider: &Provider) -> usize {
+        if !(self.rectifier_config.enabled && self.rectifier_config.request_media_fallback) {
+            return 0;
+        }
+        if !super::media_sanitizer::image_input_is_unsupported(
+            body,
+            provider,
+            self.rectifier_config.request_media_heuristic,
+        ) {
+            return 0;
+        }
+
+        let vision = &self.rectifier_config.vision_bridge;
+        let vision_replaced = if vision.enabled
+            && !vision.api_url.trim().is_empty()
+            && !vision.api_key.trim().is_empty()
+        {
+            super::media_vision::replace_direct_images_with_vision(body, vision).await
+        } else {
+            0
+        };
+
+        let marker_replaced = self.apply_media_prevention(body, provider);
+        vision_replaced + marker_replaced
+    }
+
     /// 反应式 media 重试判定：上游因图片输入报错后，是否应替换图片块并对同一供应商重试一次。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；不涉及 `request_media_heuristic`——
@@ -606,8 +634,22 @@ impl RequestForwarder {
                         &e,
                     ) {
                         let mut media_body = provider_body.clone();
-                        let replaced_images =
-                            super::media_sanitizer::replace_image_blocks_with_marker(
+                        let vision = &self.rectifier_config.vision_bridge;
+                        let vision_replaced =
+                            if vision.enabled
+                                && !vision.api_url.trim().is_empty()
+                                && !vision.api_key.trim().is_empty()
+                            {
+                                super::media_vision::replace_direct_images_with_vision(
+                                    &mut media_body,
+                                    vision,
+                                )
+                                .await
+                            } else {
+                                0
+                            };
+                        let replaced_images = vision_replaced
+                            + super::media_sanitizer::replace_image_blocks_with_marker(
                                 &mut media_body,
                             );
 
@@ -618,7 +660,7 @@ impl RequestForwarder {
                                 .and_then(Value::as_str)
                                 .unwrap_or("");
                             log::info!(
-                                "[{app_type_str}] [Media] Upstream rejected image input; retrying provider={} model={} with {replaced_images} image block(s) replaced by {}",
+                                "[{app_type_str}] [Media] Upstream rejected image input; retrying provider={} model={} with {replaced_images} image block(s) replaced by vision text / {}",
                                 provider.id,
                                 model,
                                 super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
@@ -1433,7 +1475,7 @@ impl RequestForwarder {
                     provider,
                     api_format,
                 );
-                self.apply_media_prevention(&mut mapped_body, provider);
+                self.apply_media_rectifier(&mut mapped_body, provider).await;
             }
         }
         let needs_transform = match resolved_claude_api_format.as_deref() {
@@ -1664,7 +1706,7 @@ impl RequestForwarder {
         }
 
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
-            self.apply_media_prevention(&mut request_body, provider);
+            self.apply_media_rectifier(&mut request_body, provider).await;
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游

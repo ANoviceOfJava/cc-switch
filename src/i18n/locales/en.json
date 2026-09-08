@@ -410,7 +410,14 @@
         "mediaFallback": "Unsupported Image Fallback",
         "mediaFallbackDescription": "When a provider does not support image input (it declares text-only capability, or the upstream returns an unsupported-image error), automatically replaces image blocks with an [Unsupported Image] marker so the conversation is not interrupted",
         "mediaHeuristic": "Text-Only Model Preflight",
-        "mediaHeuristicDescription": "Before sending, strips images for models in the built-in confirmed text-only registry. Turning this off only disables the proxy's registry-based preflight; declared text-only handling and upstream-error fallback remain, and Codex model-catalog capability declarations are unchanged"
+        "mediaHeuristicDescription": "Before sending, strips images for models in the built-in confirmed text-only registry. Turning this off only disables the proxy's registry-based preflight; declared text-only handling and upstream-error fallback remain, and Codex model-catalog capability declarations are unchanged",
+        "visionBridge": "Vision Bridge",
+        "visionBridgeDescription": "Advertises image input in the Codex catalog so images can be pasted; the proxy recognizes them with the configured vision model before forwarding",
+        "visionApiUrl": "Vision API URL",
+        "visionApiKey": "API Key",
+        "visionModel": "Vision model",
+        "visionTimeout": "Request timeout (seconds)",
+        "visionPrompt": "Recognition prompt (blank uses default)"
       },
       "optimizer": {
         "title": "Bedrock Request Optimizer",

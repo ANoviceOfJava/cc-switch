@@ -35,6 +35,21 @@ pub(crate) fn send_text_to_desktop_thread(
     }
 }
 
+/// 唤起 Codex 桌面端显示指定任务，用于让桌面任务列表立即刷新新建任务。
+pub(crate) fn show_desktop_thread(thread_id: &str) -> Result<(), DesktopControlError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::show_desktop_thread(thread_id)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = thread_id;
+        Err(DesktopControlError(
+            "当前系统不支持唤起 Codex 桌面端".to_string(),
+        ))
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
@@ -86,6 +101,13 @@ mod windows {
             let _ = clipboard.set_text(previous);
         }
         Ok(())
+    }
+
+    pub(super) fn show_desktop_thread(thread_id: &str) -> Result<(), DesktopControlError> {
+        if !is_safe_thread_id(thread_id) {
+            return Err(DesktopControlError("任务 ID 格式无效".to_string()));
+        }
+        open_desktop_thread(thread_id)
     }
 
     fn open_desktop_thread(thread_id: &str) -> Result<(), DesktopControlError> {

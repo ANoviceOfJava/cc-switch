@@ -81,6 +81,7 @@ struct AgentRuntime {
     known_thread_ids: HashSet<String>,
     projects: HashMap<String, CodexProject>,
     thread_summaries: HashMap<String, ThreadSummaryDto>,
+    fresh_thread_ids: HashSet<String>,
     thread_session_paths: HashMap<String, PathBuf>,
     thread_settings: HashMap<String, ThreadSettings>,
     thread_context_usage: HashMap<String, ContextUsageDto>,
@@ -369,6 +370,7 @@ impl RemoteControlAgent {
             known_thread_ids: HashSet::new(),
             projects: HashMap::new(),
             thread_summaries: HashMap::new(),
+            fresh_thread_ids: HashSet::new(),
             thread_session_paths: HashMap::new(),
             thread_settings: HashMap::new(),
             thread_context_usage: HashMap::new(),
@@ -1181,7 +1183,43 @@ impl AgentRuntime {
             .thread_summaries
             .get(thread_id)
             .cloned()
-            .ok_or_else(|| RemoteAgentError::ThreadNotFound(thread_id.to_string()))?;
+            .unwrap_or_else(|| ThreadSummaryDto {
+                pinned: false,
+                id: thread_id.to_string(),
+                project_id: None,
+                name: None,
+                preview: String::new(),
+                cwd: String::new(),
+                created_at: unix_time_millis(),
+                updated_at: unix_time_millis(),
+                status: ThreadStatusDto::NotLoaded,
+            });
+        if self.fresh_thread_ids.contains(thread_id) {
+            let selected_model = self
+                .thread_settings
+                .get(thread_id)
+                .and_then(|settings| settings.model.clone());
+            let selected_reasoning_effort = self
+                .thread_settings
+                .get(thread_id)
+                .and_then(|settings| settings.effort.clone());
+            let detail = ThreadDetailDto {
+                revision: Uuid::new_v4().to_string(),
+                generated_at: unix_time_millis(),
+                thread: summary,
+                items: self.merge_pending_user_messages(thread_id, Vec::new()),
+                active_turn_id: None,
+                selected_model,
+                selected_reasoning_effort,
+                context_usage: self.thread_context_usage.get(thread_id).copied(),
+                before,
+                has_more_before: false,
+                next_before: None,
+            };
+            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?).await?;
+            self.last_detail_thread_id = Some(thread_id.to_string());
+            return Ok(());
+        }
         if let Some((items, local_model, local_effort, local_context_usage)) =
             load_local_thread_detail(thread_id)
         {
@@ -1209,13 +1247,51 @@ impl AgentRuntime {
             self.last_detail_thread_id = Some(thread_id.to_string());
             return Ok(());
         }
-        let response = self
-            .app_server
-            .request(
-                "thread/read",
-                json!({ "threadId": thread_id, "includeTurns": true }),
-            )
-            .await?;
+        let read_result = async {
+            let params = json!({ "threadId": thread_id, "includeTurns": true });
+            let mut result = Err(AppServerError::Closed);
+            for attempt in 0..10 {
+                match self.app_server.request("thread/read", params.clone()).await {
+                    Ok(value) => {
+                        result = Ok(value);
+                        break;
+                    }
+                    Err(error) if is_thread_not_found_error(&error) && attempt < 9 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            result
+        }
+        .await;
+        let response = match read_result {
+            Ok(response) => response,
+            Err(error) if is_thread_not_found_error(&error) => {
+                let items = self.merge_pending_user_messages(thread_id, Vec::new());
+                let settings = self.thread_settings.get(thread_id);
+                let detail = ThreadDetailDto {
+                    revision: Uuid::new_v4().to_string(),
+                    generated_at: unix_time_millis(),
+                    thread: summary,
+                    items,
+                    active_turn_id: None,
+                    selected_model: settings.and_then(|settings| settings.model.clone()),
+                    selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+                    context_usage: self.thread_context_usage.get(thread_id).copied(),
+                    before,
+                    has_more_before: false,
+                    next_before: None,
+                };
+                self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?).await?;
+                self.last_detail_thread_id = Some(thread_id.to_string());
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let raw_thread: RawThread =
             serde_json::from_value(response.get("thread").cloned().ok_or_else(|| {
                 RemoteAgentError::Incompatible("thread/read 缺少 thread".to_string())
@@ -1398,14 +1474,53 @@ impl AgentRuntime {
                 .await;
             return Err(error.into());
         }
+        // 先把 thread/start 返回的任务写入内存索引，确保创建确认到达前后的
+        // thread.read 能拿到稳定的摘要；thread/list 可能稍后才包含它。
+        let thread_value = response.get("thread").cloned().unwrap_or(Value::Null);
+        let now = unix_time_millis();
+        self.thread_summaries.insert(
+            thread_id.to_string(),
+            ThreadSummaryDto {
+                pinned: false,
+                id: thread_id.to_string(),
+                project_id: Some(project_id.to_string()),
+                name: thread_value.get("name").and_then(Value::as_str).map(str::to_string),
+                preview: thread_value
+                    .get("preview")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                cwd: thread_value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or(cwd)
+                    .to_string(),
+                created_at: thread_value
+                    .get("createdAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(now),
+                updated_at: thread_value
+                    .get("updatedAt")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(now),
+                status: thread_value
+                    .get("status")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or(ThreadStatusDto::NotLoaded),
+            },
+        );
+        self.fresh_thread_ids.insert(thread_id.to_string());
         // App Server 的 thread/start 成功后，thread/list 可能短暂尚未返回新任务。
         // 等待它进入内存索引，避免前端收到创建确认后立刻发送 turn.start 却被误判为不存在。
-        for _ in 0..10 {
-            self.build_snapshot().await?;
-            if self.thread_summaries.contains_key(thread_id) {
-                break;
+        if !self.thread_summaries.contains_key(thread_id) {
+            for _ in 0..10 {
+                self.build_snapshot().await?;
+                if self.thread_summaries.contains_key(thread_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         self.send_snapshot_silent().await?;
         self.relay
@@ -1419,6 +1534,13 @@ impl AgentRuntime {
                 })),
             )?)
             .await?;
+        // 远程 Agent 与桌面端 UI 使用不同的刷新通道；唤起新任务可让桌面端
+        // 立即重新加载任务列表并显示刚创建的会话。
+        let desktop_thread_id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || desktop_control::show_desktop_thread(&desktop_thread_id))
+            .await
+            .map_err(|error| RemoteAgentError::Incompatible(format!("桌面端刷新任务中断: {error}")))?
+            .ok();
         Ok(())
     }
 
@@ -1447,13 +1569,6 @@ impl AgentRuntime {
     ) -> Result<(), RemoteAgentError> {
         self.send_execution_status(thread_id, "starting", "正在启动任务")
             .await?;
-        if !self.thread_summaries.contains_key(thread_id) {
-            self.build_snapshot().await?;
-        }
-        if !self.thread_summaries.contains_key(thread_id) {
-            return Err(RemoteAgentError::ThreadNotFound(thread_id.to_string()));
-        }
-
         let uploaded_attachments = attachments
             .iter()
             .map(|attachment| {
@@ -1484,11 +1599,36 @@ impl AgentRuntime {
         if let Some(model) = &model {
             resume_params.insert("model".to_string(), json!(model));
         }
-        if let Err(error) = self
-            .app_server
-            .request("thread/resume", Value::Object(resume_params))
-            .await
-        {
+        let is_fresh_thread = self.fresh_thread_ids.remove(thread_id);
+        let resume_result = if is_fresh_thread {
+            // thread/start 创建的空任务无需 resume；部分 App Server 版本会在
+            // 空任务上尝试调用尚未实现的 list_turns。
+            Ok(Value::Null)
+        } else {
+            let resume_params = Value::Object(resume_params);
+            let mut result = Err(AppServerError::Closed);
+            for attempt in 0..10 {
+                match self
+                    .app_server
+                    .request("thread/resume", resume_params.clone())
+                    .await
+                {
+                    Ok(value) => {
+                        result = Ok(value);
+                        break;
+                    }
+                    Err(error) if is_thread_not_found_error(&error) && attempt < 9 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            result
+        };
+        if let Err(error) = resume_result {
             if !is_active_writer_conflict(&error) {
                 return Err(error.into());
             }
@@ -1949,6 +2089,14 @@ fn is_active_writer_conflict(error: &AppServerError) -> bool {
         error,
         AppServerError::Remote { message, .. }
             if message.contains("already has an active writer")
+    )
+}
+
+fn is_thread_not_found_error(error: &AppServerError) -> bool {
+    matches!(
+        error,
+        AppServerError::Remote { message, .. }
+            if message.contains("找不到任务") || message.contains("thread not found")
     )
 }
 

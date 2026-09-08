@@ -644,7 +644,62 @@ pub async fn set_rectifier_config(
         .db
         .set_rectifier_config(&config)
         .map_err(|e| e.to_string())?;
+    sync_codex_vision_bridge_catalog_markers(&state.db, config.vision_bridge.enabled)
+        .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+fn sync_codex_vision_bridge_catalog_markers(
+    db: &crate::database::Database,
+    enabled: bool,
+) -> Result<(), String> {
+    let providers = db
+        .get_all_providers(crate::app_config::AppType::Codex.as_str())
+        .map_err(|e| e.to_string())?;
+
+    for (provider_id, provider) in providers {
+        let mut settings = provider.settings_config.clone();
+        if crate::codex_config::apply_codex_vision_bridge_catalog_marker(&mut settings, enabled) {
+            db.update_provider_settings_config(
+                crate::app_config::AppType::Codex.as_str(),
+                &provider_id,
+                &settings,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(current_provider_id) = db
+        .get_current_provider(crate::app_config::AppType::Codex.as_str())
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(provider) = db
+            .get_provider_by_id(
+                &current_provider_id,
+                crate::app_config::AppType::Codex.as_str(),
+            )
+            .map_err(|e| e.to_string())?
+        {
+            let settings = provider
+                .settings_config
+                .as_object()
+                .ok_or_else(|| "Codex 供应商配置必须是对象".to_string())?;
+            let auth = settings
+                .get("auth")
+                .ok_or_else(|| "Codex 供应商缺少 auth 配置".to_string())?;
+            let config_text = settings.get("config").and_then(serde_json::Value::as_str);
+            let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(&provider);
+            crate::codex_config::write_codex_provider_live_with_catalog(
+                &provider.settings_config,
+                provider.category.as_deref(),
+                auth,
+                config_text,
+                profile,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// 获取优化器配置

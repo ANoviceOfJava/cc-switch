@@ -1547,7 +1547,15 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
             .get("supportsParallelToolCalls")
             .or_else(|| model_config.get("supports_parallel_tool_calls"))
             .and_then(|value| value.as_bool());
-        let input_modalities = model_config
+        let input_modalities = if model_config
+            .get("ccSwitchVisionBridge")
+            .or_else(|| model_config.get("cc_switch_vision_bridge"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            Some(vec!["text".to_string(), "image".to_string()])
+        } else {
+            model_config
             .get("inputModalities")
             .or_else(|| model_config.get("input_modalities"))
             .and_then(|value| value.as_array())
@@ -1558,7 +1566,8 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             })
-            .filter(|items| !items.is_empty());
+            .filter(|items| !items.is_empty())
+        };
 
         let base_instructions = model_config
             .get("baseInstructions")
@@ -1603,6 +1612,38 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
     }
 
     specs
+}
+
+/// Add/remove a per-row marker that makes generated Codex catalogs declare
+/// image input even when the real upstream model is text-only. The proxy keeps
+/// using the original modalities/registry for request-side media handling.
+pub fn apply_codex_vision_bridge_catalog_marker(settings: &mut Value, enabled: bool) -> bool {
+    let Some(models) = settings
+        .get_mut("modelCatalog")
+        .and_then(|catalog| catalog.get_mut("models"))
+        .and_then(|models| models.as_array_mut())
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for model in models {
+        let Some(model) = model.as_object_mut() else {
+            continue;
+        };
+        if enabled {
+            if model.insert(
+                "ccSwitchVisionBridge".to_string(),
+                Value::Bool(true),
+            ) != Some(Value::Bool(true))
+            {
+                changed = true;
+            }
+        } else if model.remove("ccSwitchVisionBridge").is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {

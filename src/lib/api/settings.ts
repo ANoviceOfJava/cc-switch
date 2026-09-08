@@ -347,6 +347,16 @@ export interface RectifierConfig {
   requestThinkingBudget: boolean;
   requestMediaFallback: boolean;
   requestMediaHeuristic: boolean;
+  visionBridge: VisionBridgeConfig;
+}
+
+export interface VisionBridgeConfig {
+  enabled: boolean;
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+  prompt: string;
+  timeoutSeconds: number;
 }
 
 export interface OptimizerConfig {
