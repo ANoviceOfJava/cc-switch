@@ -650,28 +650,6 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
     icon: "a6api",
   },
   {
-    name: "AtlasCloud",
-    providerKey: "cc-switch-atlas-cloud",
-    websiteUrl: "https://www.atlascloud.ai/console/coding-plan",
-    apiKeyUrl: "https://www.atlascloud.ai/console/coding-plan",
-    settingsConfig: {
-      name: "AtlasCloud",
-      baseUrl: "https://api.atlascloud.ai/v1",
-      api: "openai-completions",
-      apiKey: "",
-      models: [
-        piModel("zai/glm-5.1", {
-          id: "zai-org/glm-5.1",
-          name: "GLM 5.1",
-        }),
-      ],
-    },
-    category: "aggregator",
-    isPartner: true,
-    partnerPromotionKey: "atlascloud",
-    icon: "atlascloud",
-  },
-  {
     name: "CCSub",
     providerKey: "cc-switch-ccsub",
     websiteUrl: "https://www.ccsub.net",
@@ -949,6 +927,26 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
     },
     category: "aggregator",
     icon: "amux",
+  },
+  {
+    name: "AtlasCloud",
+    providerKey: "cc-switch-atlas-cloud",
+    websiteUrl: "https://www.atlascloud.ai/console/coding-plan",
+    apiKeyUrl: "https://www.atlascloud.ai/console/coding-plan",
+    settingsConfig: {
+      name: "AtlasCloud",
+      baseUrl: "https://api.atlascloud.ai/v1",
+      api: "openai-completions",
+      apiKey: "",
+      models: [
+        piModel("zai/glm-5.1", {
+          id: "zai-org/glm-5.1",
+          name: "GLM 5.1",
+        }),
+      ],
+    },
+    category: "aggregator",
+    icon: "atlascloud",
   },
   {
     name: "DeepSeek",
@@ -1238,13 +1236,13 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
       api: "openai-completions",
       apiKey: "",
       models: [
-        piModel("minimax/minimax-m2.7", {
-          id: "MiniMax-M2.7",
+        piModel("minimax/minimax-m3", {
+          id: "MiniMax-M3",
+          maxTokens: 131072,
         }),
       ],
     },
     category: "cn_official",
-    partnerPromotionKey: "minimax_cn",
     theme: {
       backgroundColor: "#f64551",
       textColor: "#FFFFFF",
@@ -1263,13 +1261,13 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
       api: "openai-completions",
       apiKey: "",
       models: [
-        piModel("minimax/minimax-m2.7", {
-          id: "MiniMax-M2.7",
+        piModel("minimax/minimax-m3", {
+          id: "MiniMax-M3",
+          maxTokens: 131072,
         }),
       ],
     },
     category: "cn_official",
-    partnerPromotionKey: "minimax_en",
     theme: {
       backgroundColor: "#f64551",
       textColor: "#FFFFFF",
