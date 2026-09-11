@@ -503,6 +503,11 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             set_windows_app_user_model_id(app.handle());
 
+            // Updater 在独立设置页触发，使用 reqwest 自身读取进程代理环境。
+            // Windows 先继承系统代理，确保未显式配置全局代理时仍能检查更新。
+            #[cfg(target_os = "windows")]
+            crate::proxy::http_client::inherit_windows_system_proxy_env();
+
             // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
             #[cfg(desktop)]
             {

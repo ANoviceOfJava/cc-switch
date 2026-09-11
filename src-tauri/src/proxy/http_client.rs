@@ -34,6 +34,100 @@ pub fn set_proxy_port(port: u16) {
     }
 }
 
+/// 继承 Windows 当前用户配置的系统代理到当前进程环境。
+///
+/// Tauri Updater 的 reqwest 客户端只读取进程环境变量，不会直接读取
+/// Windows Internet Settings。应用未显式配置全局出站代理时，将系统代理
+/// 写入当前进程环境，使 Updater 和应用 HTTP 客户端都默认跟随本机代理。
+#[cfg(target_os = "windows")]
+pub fn inherit_windows_system_proxy_env() {
+    let Some((http_proxy, https_proxy)) = read_windows_system_proxy() else {
+        return;
+    };
+
+    if env_is_unset("HTTP_PROXY") && env_is_unset("http_proxy") {
+        env::set_var("HTTP_PROXY", &http_proxy);
+        log::info!(
+            "[GlobalProxy] Inherited Windows system proxy: {}",
+            mask_url(&http_proxy)
+        );
+    }
+    if env_is_unset("HTTPS_PROXY") && env_is_unset("https_proxy") {
+        env::set_var("HTTPS_PROXY", &https_proxy);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn env_is_unset(key: &str) -> bool {
+    env::var(key)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_system_proxy() -> Option<(String, String)> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+
+    let internet_settings = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            KEY_READ,
+        )
+        .ok()?;
+    let enabled: u32 = internet_settings.get_value("ProxyEnable").ok()?;
+    if enabled == 0 {
+        return None;
+    }
+
+    let server: String = internet_settings.get_value("ProxyServer").ok()?;
+    parse_windows_proxy_server(&server)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_proxy_server(value: &str) -> Option<(String, String)> {
+    let mut http_proxy = None;
+    let mut https_proxy = None;
+    let mut fallback_proxy = None;
+
+    for entry in value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((scheme, endpoint)) = entry.split_once('=') else {
+            fallback_proxy = Some(normalize_proxy_endpoint(entry)?);
+            continue;
+        };
+        let endpoint = normalize_proxy_endpoint(endpoint.trim())?;
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "http" => http_proxy = Some(endpoint),
+            "https" => https_proxy = Some(endpoint),
+            "socks" | "socks5" => fallback_proxy = Some(endpoint),
+            _ => {}
+        }
+    }
+
+    let fallback = fallback_proxy
+        .or_else(|| http_proxy.clone())
+        .or_else(|| https_proxy.clone())?;
+    let http = http_proxy.unwrap_or_else(|| fallback.clone());
+    let https = https_proxy.unwrap_or(fallback);
+    Some((http, https))
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_proxy_endpoint(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains("://") {
+        return Some(value.to_string());
+    }
+    Some(format!("http://{value}"))
+}
+
 /// 获取 CC Switch 代理服务器的监听端口
 fn get_proxy_port() -> u16 {
     CC_SWITCH_PROXY_PORT
@@ -461,5 +555,37 @@ mod tests {
         for key in &keys {
             std::env::remove_var(key);
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_proxy_server_single_endpoint() {
+        assert_eq!(
+            parse_windows_proxy_server("127.0.0.1:7890"),
+            Some((
+                "http://127.0.0.1:7890".to_string(),
+                "http://127.0.0.1:7890".to_string()
+            ))
+        );
+        assert_eq!(parse_windows_proxy_server("   "), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_parse_windows_proxy_server_protocol_mapping() {
+        assert_eq!(
+            parse_windows_proxy_server("http=proxy.local:8080;https=secure.local:8443"),
+            Some((
+                "http://proxy.local:8080".to_string(),
+                "http://secure.local:8443".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_windows_proxy_server("socks=127.0.0.1:1080"),
+            Some((
+                "http://127.0.0.1:1080".to_string(),
+                "http://127.0.0.1:1080".to_string()
+            ))
+        );
     }
 }
