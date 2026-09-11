@@ -98,7 +98,7 @@ describe("PPIO provider presets", () => {
           model: ppioModelId,
           displayName: ppioModelName,
           contextWindow: 1048576,
-          inputModalities: ["text"],
+          inputModalities: ["text", "image"],
         },
       ],
       codexChatReasoning: {

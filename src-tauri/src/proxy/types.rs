@@ -218,57 +218,6 @@ pub struct RectifierConfig {
     /// 仍保留「显式声明」与「上游兜底」，且不改变 Codex 模型目录声明。
     #[serde(default = "default_true")]
     pub request_media_heuristic: bool,
-    /// 多模态识图桥接：text-only 模型收到图片时先调用该服务识别。
-    #[serde(default)]
-    pub vision_bridge: VisionBridgeConfig,
-}
-
-/// 多模态识图桥接配置。
-///
-/// 开启后，代理在把请求发送给 text-only 模型前，会把图片块发送给
-/// 一个 OpenAI Chat Completions 兼容的视觉模型，再把识别文本注入原请求。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VisionBridgeConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    /// OpenAI Chat Completions 兼容的视觉接口完整地址。
-    #[serde(default = "default_vision_api_url")]
-    pub api_url: String,
-    #[serde(default)]
-    pub api_key: String,
-    #[serde(default = "default_vision_model")]
-    pub model: String,
-    /// 识别提示词，留空使用内置默认值。
-    #[serde(default)]
-    pub prompt: String,
-    #[serde(default = "default_vision_timeout_seconds")]
-    pub timeout_seconds: u64,
-}
-
-fn default_vision_api_url() -> String {
-    "https://open.bigmodel.cn/api/paas/v4/chat/completions".to_string()
-}
-
-fn default_vision_model() -> String {
-    "glm-4v-flash".to_string()
-}
-
-fn default_vision_timeout_seconds() -> u64 {
-    60
-}
-
-impl Default for VisionBridgeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_url: default_vision_api_url(),
-            api_key: String::new(),
-            model: default_vision_model(),
-            prompt: String::new(),
-            timeout_seconds: default_vision_timeout_seconds(),
-        }
-    }
 }
 
 fn default_true() -> bool {
@@ -287,7 +236,6 @@ impl Default for RectifierConfig {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
-            vision_bridge: VisionBridgeConfig::default(),
         }
     }
 }

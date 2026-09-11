@@ -150,7 +150,6 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
-            vision_bridge: crate::proxy::types::VisionBridgeConfig::default(),
         }
     }
 
@@ -161,7 +160,6 @@ mod tests {
             request_thinking_budget: false,
             request_media_fallback: true,
             request_media_heuristic: true,
-            vision_bridge: crate::proxy::types::VisionBridgeConfig::default(),
         }
     }
 
@@ -172,7 +170,6 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
-            vision_bridge: crate::proxy::types::VisionBridgeConfig::default(),
         }
     }
 

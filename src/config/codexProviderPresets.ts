@@ -568,7 +568,7 @@ requires_openai_auth = true`,
         model: "deepseek/deepseek-v4-flash-0731",
         displayName: "Deepseek V4 Flash 0731",
         contextWindow: 1048576,
-        inputModalities: ["text"],
+        inputModalities: ["text", "image"],
       },
     ]),
     codexChatReasoning: {

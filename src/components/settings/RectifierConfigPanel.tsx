@@ -3,32 +3,20 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import {
   settingsApi,
   type RectifierConfig,
-  type VisionBridgeConfig,
   type OptimizerConfig,
 } from "@/lib/api/settings";
 
 export function RectifierConfigPanel() {
   const { t } = useTranslation();
-  const defaultVisionBridge: VisionBridgeConfig = {
-    enabled: false,
-    apiUrl: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    apiKey: "",
-    model: "glm-4v-flash",
-    prompt: "",
-    timeoutSeconds: 60,
-  };
   const [config, setConfig] = useState<RectifierConfig>({
     enabled: true,
     requestThinkingSignature: true,
     requestThinkingBudget: true,
     requestMediaFallback: true,
     requestMediaHeuristic: true,
-    visionBridge: defaultVisionBridge,
   });
   const [optimizerConfig, setOptimizerConfig] = useState<OptimizerConfig>({
     enabled: false,
@@ -40,12 +28,7 @@ export function RectifierConfigPanel() {
   useEffect(() => {
     settingsApi
       .getRectifierConfig()
-      .then((loaded) =>
-        setConfig({
-          ...loaded,
-          visionBridge: { ...defaultVisionBridge, ...loaded.visionBridge },
-        }),
-      )
+      .then(setConfig)
       .catch((e) => console.error("Failed to load rectifier config:", e))
       .finally(() => setIsLoading(false));
     settingsApi
@@ -61,23 +44,6 @@ export function RectifierConfigPanel() {
       await settingsApi.setRectifierConfig(newConfig);
     } catch (e) {
       console.error("Failed to save rectifier config:", e);
-      toast.error(String(e));
-      setConfig(config);
-    }
-  };
-
-  const handleVisionBridgeChange = async (
-    updates: Partial<VisionBridgeConfig>,
-  ) => {
-    const newConfig = {
-      ...config,
-      visionBridge: { ...config.visionBridge, ...updates },
-    };
-    setConfig(newConfig);
-    try {
-      await settingsApi.setRectifierConfig(newConfig);
-    } catch (e) {
-      console.error("Failed to save vision bridge config:", e);
       toast.error(String(e));
       setConfig(config);
     }
@@ -175,92 +141,6 @@ export function RectifierConfigPanel() {
               handleChange({ requestMediaHeuristic: checked })
             }
           />
-        </div>
-        <div className="rounded-lg border border-border/60 p-4 pl-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label>{t("settings.advanced.rectifier.visionBridge")}</Label>
-              <p className="text-xs text-muted-foreground">
-                {t("settings.advanced.rectifier.visionBridgeDescription")}
-              </p>
-            </div>
-            <Switch
-              checked={config.visionBridge.enabled}
-              disabled={!config.enabled || !config.requestMediaFallback}
-              onCheckedChange={(checked) =>
-                handleVisionBridgeChange({ enabled: checked })
-              }
-            />
-          </div>
-          {config.visionBridge.enabled && (
-            <div className="space-y-4 pl-4">
-              <div className="grid gap-1.5">
-                <Label htmlFor="vision-api-url">
-                  {t("settings.advanced.rectifier.visionApiUrl")}
-                </Label>
-                <Input
-                  id="vision-api-url"
-                  value={config.visionBridge.apiUrl}
-                  onChange={(e) =>
-                    handleVisionBridgeChange({ apiUrl: e.target.value })
-                  }
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="vision-api-key">
-                  {t("settings.advanced.rectifier.visionApiKey")}
-                </Label>
-                <Input
-                  id="vision-api-key"
-                  type="password"
-                  value={config.visionBridge.apiKey}
-                  onChange={(e) =>
-                    handleVisionBridgeChange({ apiKey: e.target.value })
-                  }
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="vision-model">
-                  {t("settings.advanced.rectifier.visionModel")}
-                </Label>
-                <Input
-                  id="vision-model"
-                  value={config.visionBridge.model}
-                  onChange={(e) =>
-                    handleVisionBridgeChange({ model: e.target.value })
-                  }
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="vision-timeout">
-                  {t("settings.advanced.rectifier.visionTimeout")}
-                </Label>
-                <Input
-                  id="vision-timeout"
-                  type="number"
-                  min={5}
-                  value={config.visionBridge.timeoutSeconds}
-                  onChange={(e) =>
-                    handleVisionBridgeChange({
-                      timeoutSeconds: Number(e.target.value) || 60,
-                    })
-                  }
-                />
-              </div>
-              <div className="grid gap-1.5">
-                <Label htmlFor="vision-prompt">
-                  {t("settings.advanced.rectifier.visionPrompt")}
-                </Label>
-                <Textarea
-                  id="vision-prompt"
-                  value={config.visionBridge.prompt}
-                  onChange={(e) =>
-                    handleVisionBridgeChange({ prompt: e.target.value })
-                  }
-                />
-              </div>
-            </div>
-          )}
         </div>
       </div>
 

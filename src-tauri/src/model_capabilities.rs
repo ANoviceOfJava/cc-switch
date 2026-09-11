@@ -73,8 +73,6 @@ pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
         "ark-code-latest",
         "deepseek-chat",
         "deepseek-reasoner",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
         "glm-5.1",
         // Exact rather than prefix matching: GLM visual models use a `v`
         // suffix (for example glm-5.2v), which must remain image-capable.
@@ -131,17 +129,19 @@ fn declared_model_image_support_in_value(value: &Value, model: &str) -> Option<b
     })
 }
 
-fn explicit_image_support(entry: &Value) -> Option<bool> {
-    if entry
+pub(crate) fn has_legacy_vision_bridge_marker(entry: &Value) -> bool {
+    entry
         .get("ccSwitchVisionBridge")
         .or_else(|| entry.get("cc_switch_vision_bridge"))
         .and_then(Value::as_bool)
         == Some(true)
-    {
-        // The catalog declares image input only because cc-switch will bridge
-        // it through an external vision model; the upstream model itself is
-        // still treated as text-only during request rectification.
-        return Some(false);
+}
+
+fn explicit_image_support(entry: &Value) -> Option<bool> {
+    // The bridge feature was removed. Ignore stale text-only declarations that
+    // were written alongside its marker so current capabilities take over.
+    if has_legacy_vision_bridge_marker(entry) {
+        return None;
     }
 
     if let Some(value) = entry
@@ -228,7 +228,9 @@ mod tests {
 
     #[test]
     fn confirmed_text_only_registry_normalizes_namespaces_and_context_markers() {
-        assert!(is_confirmed_text_only_model("deepseek/deepseek-v4-pro"));
+        assert!(is_confirmed_text_only_model("deepseek/deepseek-chat"));
+        assert!(!is_confirmed_text_only_model("deepseek-v4-flash"));
+        assert!(!is_confirmed_text_only_model("deepseek-v4-pro"));
         assert!(is_confirmed_text_only_model("GLM-5.2[1M]"));
         assert!(is_confirmed_text_only_model("GLM-5.3[1M]"));
         assert!(is_confirmed_text_only_model("qwen/qwen3-coder-plus"));
@@ -269,6 +271,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_vision_bridge_marker_ignores_stale_text_modalities() {
+        let settings = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputModalities": ["text"],
+                        "ccSwitchVisionBridge": true
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            image_input_capability_from_settings(&settings, "deepseek-v4-flash", true),
+            ImageInputCapability::Unknown
+        );
+    }
+
+    #[test]
     fn provider_settings_support_multiple_capability_shapes() {
         let settings = json!({
             "modelCatalog": {
@@ -285,26 +307,6 @@ mod tests {
         );
         assert_eq!(
             image_input_capability_from_settings(&settings, "text", true),
-            ImageInputCapability::Unsupported
-        );
-    }
-
-    #[test]
-    fn vision_bridge_marker_keeps_upstream_text_only_for_proxy() {
-        let settings = json!({
-            "modelCatalog": {
-                "models": [
-                    {
-                        "model": "relay-model",
-                        "inputModalities": ["text"],
-                        "ccSwitchVisionBridge": true
-                    }
-                ]
-            }
-        });
-
-        assert_eq!(
-            image_input_capability_from_settings(&settings, "relay-model", true),
             ImageInputCapability::Unsupported
         );
     }

@@ -6,7 +6,9 @@ use crate::config::{
     sanitize_provider_name, write_json_file, write_text_file,
 };
 use crate::error::AppError;
-use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
+use crate::model_capabilities::{
+    has_legacy_vision_bridge_marker, image_input_capability_from_modalities, ImageInputCapability,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -1719,27 +1721,24 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
             .get("supportsParallelToolCalls")
             .or_else(|| model_config.get("supports_parallel_tool_calls"))
             .and_then(|value| value.as_bool());
-        let input_modalities = if model_config
-            .get("ccSwitchVisionBridge")
-            .or_else(|| model_config.get("cc_switch_vision_bridge"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            Some(vec!["text".to_string(), "image".to_string()])
-        } else {
-            model_config
-            .get("inputModalities")
-            .or_else(|| model_config.get("input_modalities"))
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+        // Old bridge-enabled configs still carry stale text-only modalities.
+        // Ignore those declarations so current model capabilities take over.
+        let input_modalities = (!has_legacy_vision_bridge_marker(model_config))
+            .then(|| {
+                model_config
+                    .get("inputModalities")
+                    .or_else(|| model_config.get("input_modalities"))
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|items| !items.is_empty())
             })
-            .filter(|items| !items.is_empty())
-        };
+            .flatten();
 
         let base_instructions = model_config
             .get("baseInstructions")
@@ -1784,38 +1783,6 @@ fn codex_catalog_model_specs(settings: &Value) -> Vec<CodexCatalogModelSpec> {
     }
 
     specs
-}
-
-/// Add/remove a per-row marker that makes generated Codex catalogs declare
-/// image input even when the real upstream model is text-only. The proxy keeps
-/// using the original modalities/registry for request-side media handling.
-pub fn apply_codex_vision_bridge_catalog_marker(settings: &mut Value, enabled: bool) -> bool {
-    let Some(models) = settings
-        .get_mut("modelCatalog")
-        .and_then(|catalog| catalog.get_mut("models"))
-        .and_then(|models| models.as_array_mut())
-    else {
-        return false;
-    };
-
-    let mut changed = false;
-    for model in models {
-        let Some(model) = model.as_object_mut() else {
-            continue;
-        };
-        if enabled {
-            if model.insert(
-                "ccSwitchVisionBridge".to_string(),
-                Value::Bool(true),
-            ) != Some(Value::Bool(true))
-            {
-                changed = true;
-            }
-        } else if model.remove("ccSwitchVisionBridge").is_some() {
-            changed = true;
-        }
-    }
-    changed
 }
 
 fn find_codex_model_template(catalog: &Value) -> Option<Value> {
@@ -6834,34 +6801,25 @@ base_url = "https://production.api/v1"
     }
 
     #[test]
-    fn vision_bridge_marker_forces_catalog_image_without_changing_stored_modalities() {
-        let mut settings = json!({
+    fn legacy_vision_bridge_marker_ignores_stale_catalog_modalities() {
+        let settings = json!({
             "modelCatalog": {
                 "models": [
                     {
                         "model": "deepseek-v4-flash",
-                        "inputModalities": ["text"]
+                        "inputModalities": ["text"],
+                        "ccSwitchVisionBridge": true
                     }
                 ]
             }
         });
 
-        assert!(apply_codex_vision_bridge_catalog_marker(&mut settings, true));
         let specs = codex_catalog_model_specs(&settings);
-        assert_eq!(
-            specs[0].input_modalities,
-            Some(vec!["text".to_string(), "image".to_string()])
-        );
-        assert_eq!(
-            settings["modelCatalog"]["models"][0]["inputModalities"],
-            json!(["text"])
-        );
 
-        assert!(apply_codex_vision_bridge_catalog_marker(&mut settings, false));
-        let specs = codex_catalog_model_specs(&settings);
+        assert_eq!(specs[0].input_modalities, None);
         assert_eq!(
-            specs[0].input_modalities,
-            Some(vec!["text".to_string()])
+            codex_catalog_input_modalities(&specs[0].model, specs[0].input_modalities.as_deref()),
+            vec!["text", "image"]
         );
     }
 
@@ -7121,8 +7079,8 @@ base_url = "https://production.api/v1"
     #[test]
     fn vendor_catalog_unknown_model_does_not_inherit_flagship_modalities() {
         // A vision variant not in the official DeepSeek catalog must not
-        // inherit the flagship entry's text-only modalities; the registry /
-        // fail-open logic should resolve it as image-capable instead.
+        // inherit the flagship entry's modalities; the registry / fail-open
+        // logic should resolve it as image-capable instead.
         let settings = json!({
             "modelCatalog": {
                 "models": [
@@ -7151,7 +7109,7 @@ base_url = "https://production.api/v1"
         assert_eq!(
             modalities,
             vec!["text", "image"],
-            "unknown vision model must not inherit the flagship's text-only modalities"
+            "unknown vision model must not inherit the flagship's modalities"
         );
     }
 
@@ -7190,7 +7148,7 @@ base_url = "https://production.api/v1"
     #[test]
     fn vendor_catalog_matched_model_keeps_vendor_modalities() {
         // A model that IS in the official catalog must keep the vendor's
-        // declared modalities (deepseek-v4-flash is text-only).
+        // declared modalities (DeepSeek V4 now supports image input).
         let settings = json!({
             "modelCatalog": {
                 "models": [
@@ -7216,7 +7174,7 @@ base_url = "https://production.api/v1"
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(modalities, vec!["text"]);
+        assert_eq!(modalities, vec!["text", "image"]);
     }
 
     #[test]
@@ -7310,8 +7268,8 @@ base_url = "https://production.api/v1"
                 default_reasoning_level: None,
             },
             CodexCatalogModelSpec {
-                model: "deepseek/deepseek-v4-pro".to_string(),
-                display_name: Some("DeepSeek V4 Pro".to_string()),
+                model: "deepseek/deepseek-chat".to_string(),
+                display_name: Some("DeepSeek Chat".to_string()),
                 context_window: Some(128_000),
                 supports_parallel_tool_calls: None,
                 input_modalities: None,
@@ -7368,7 +7326,7 @@ base_url = "https://production.api/v1"
             };
 
             assert_eq!(modalities("gpt-5.4"), json!(["text", "image"]));
-            assert_eq!(modalities("deepseek/deepseek-v4-pro"), json!(["text"]));
+            assert_eq!(modalities("deepseek/deepseek-chat"), json!(["text"]));
             assert_eq!(modalities("glm-5.2v"), json!(["text", "image"]));
             assert_eq!(
                 modalities("deepseek-v4-flash"),
@@ -7476,7 +7434,10 @@ wire_api = "responses"
             flash.get("supports_reasoning_summaries"),
             Some(&json!(true))
         );
-        assert_eq!(flash.get("input_modalities"), Some(&json!(["text"])));
+        assert_eq!(
+            flash.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
         assert!(
             flash.get("model_messages").is_some(),
             "official entries are mirrored verbatim, incl. model_messages"
@@ -7974,9 +7935,9 @@ web_search = "disabled"
         let catalog = r#"{
             "models": [
                 { "slug": "gpt-5.4", "input_modalities": ["text", "image"] },
-                { "slug": "deepseek-v4-pro", "input_modalities": ["text"] },
+                { "slug": "deepseek-chat", "input_modalities": ["text"] },
                 { "slug": "gpt-text-override", "input_modalities": ["text"] },
-                { "slug": "deepseek-v4-flash", "input_modalities": ["text", "image"] }
+                { "slug": "glm-5.3", "input_modalities": ["text", "image"] }
             ]
         }"#;
 
