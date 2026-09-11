@@ -15,6 +15,9 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect_release.outputs.version }}
+      should_release: ${{ steps.detect_release.outputs.should_release }}
     steps:
       - name: Checkout custom main
         uses: actions/checkout@v4
@@ -38,3 +41,25 @@ jobs:
             exit 0
           fi
           git push origin main
+
+      - name: Detect release version
+        id: detect_release
+        shell: bash
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    if: needs.sync.outputs.should_release == 'true'
+    needs: sync
+    permissions:
+      contents: write
+    uses: ./.github/workflows/custom-release.yml
+    with:
+      version: ${{ needs.sync.outputs.version }}
+    secrets: inherit

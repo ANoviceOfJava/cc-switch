@@ -1,0 +1,100 @@
+name: Build custom Windows release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout synchronized main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare Tauri signing key
+        shell: pwsh
+        env:
+          SIGNING_KEY_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY_B64)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is missing"
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP "tauri-signing.key"
+          $bytes = [Convert]::FromBase64String($env:SIGNING_KEY_B64.Trim())
+          [IO.File]::WriteAllBytes($keyPath, $bytes)
+          "TAURI_SIGNING_PRIVATE_KEY=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build signed Windows packages
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --bundles nsis --ci
+
+      - name: Prepare release assets
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $tag = "v$env:VERSION"
+          $assetDir = "release-assets"
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*_x64-setup.exe" -File | Select-Object -First 1
+          if (-not $setup) { throw "NSIS setup executable not found" }
+          $signaturePath = "$($setup.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath)) { throw "NSIS signature not found: $signaturePath" }
+
+          $portable = "src-tauri/target/release/cc-switch.exe"
+          if (-not (Test-Path -LiteralPath $portable)) { throw "Portable executable not found: $portable" }
+
+          $setupName = "CC-Switch-$tag-Windows-x64-setup.exe"
+          $portableName = "CC-Switch-$tag-Windows-x64-Portable.exe"
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $assetDir $setupName) -Force
+          Copy-Item -LiteralPath $portable -Destination (Join-Path $assetDir $portableName) -Force
+
+          $latest = [ordered]@{
+            version = $env:VERSION
+            notes = "Custom CC Switch fork release $tag"
+            pub_date = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content -Raw -LiteralPath $signaturePath).Trim()
+                url = "https://github.com/ANoviceOfJava/cc-switch/releases/download/$tag/$setupName"
+              }
+            }
+          }
+          $json = $latest | ConvertTo-Json -Depth 6
+          [IO.File]::WriteAllText((Join-Path $assetDir "latest.json"), $json, [Text.UTF8Encoding]::new($false))
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.version }}
+          name: CC Switch v${{ inputs.version }}
+          body: |
+            Custom fork build synchronized from official CC Switch.
+            Includes the Windows portable EXE and the signed updater installer.
+          files: release-assets/*
+          make_latest: true
