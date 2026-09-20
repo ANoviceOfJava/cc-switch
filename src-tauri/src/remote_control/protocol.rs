@@ -9,6 +9,8 @@ const MAX_REQUEST_ID_LENGTH: usize = 100;
 const MAX_IDENTIFIER_LENGTH: usize = 512;
 const MAX_TURN_TEXT_LENGTH: usize = 200_000;
 const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024;
+const MAX_SKILLS_PER_TURN: usize = 12;
+const MAX_GOAL_OBJECTIVE_LENGTH: usize = 20_000;
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const DEFAULT_THREAD_PAGE_LIMIT: usize = 5;
 const MAX_THREAD_PAGE_LIMIT: usize = 20;
@@ -47,7 +49,29 @@ pub(crate) enum RemoteCommand {
         text: String,
         model: Option<String>,
         effort: Option<String>,
+        approval_policy: Option<Value>,
+        sandbox_policy: Option<Value>,
+        collaboration_mode: Option<String>,
+        skills: Vec<RemoteSkill>,
         attachments: Vec<RemoteAttachment>,
+    },
+    QueueTurn {
+        request_id: Option<String>,
+        queue_id: String,
+        thread_id: String,
+        text: String,
+        model: Option<String>,
+        effort: Option<String>,
+        approval_policy: Option<Value>,
+        sandbox_policy: Option<Value>,
+        collaboration_mode: Option<String>,
+        skills: Vec<RemoteSkill>,
+        attachments: Vec<RemoteAttachment>,
+    },
+    SteerQueuedTurn {
+        request_id: Option<String>,
+        thread_id: String,
+        queue_id: String,
     },
     StartAttachmentUpload {
         request_id: Option<String>,
@@ -81,13 +105,66 @@ pub(crate) enum RemoteCommand {
         thread_id: String,
         pinned: bool,
     },
+    ListSkills {
+        request_id: Option<String>,
+        thread_id: Option<String>,
+        project_id: Option<String>,
+        force_reload: bool,
+    },
+    SetCollaborationMode {
+        request_id: Option<String>,
+        thread_id: String,
+        mode: String,
+    },
+    SetThreadGoal {
+        request_id: Option<String>,
+        thread_id: String,
+        objective: String,
+        token_budget: Option<i64>,
+    },
+    ClearThreadGoal {
+        request_id: Option<String>,
+        thread_id: String,
+    },
+    SetThreadName {
+        request_id: Option<String>,
+        thread_id: String,
+        name: String,
+    },
+    ArchiveThread {
+        request_id: Option<String>,
+        thread_id: String,
+    },
+    DeleteThread {
+        request_id: Option<String>,
+        thread_id: String,
+    },
+    CompactThread {
+        request_id: Option<String>,
+        thread_id: String,
+    },
+    ListModels {
+        request_id: Option<String>,
+    },
+    SelectModel {
+        request_id: Option<String>,
+        provider_id: String,
+        model_id: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct KnownThreadRevision {
     pub(crate) id: String,
     pub(crate) signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RemoteSkill {
+    pub(crate) name: String,
+    pub(crate) path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -156,7 +233,24 @@ struct StartTurnPayload {
     model: Option<String>,
     effort: Option<String>,
     #[serde(default)]
+    approval_policy: Option<Value>,
+    #[serde(default)]
+    sandbox_policy: Option<Value>,
+    #[serde(default)]
+    collaboration_mode: Option<String>,
+    #[serde(default)]
+    skills: Vec<RemoteSkill>,
+    #[serde(default)]
     attachments: Vec<RemoteAttachment>,
+    #[serde(default)]
+    queue_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SteerQueuedTurnPayload {
+    thread_id: String,
+    queue_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +304,59 @@ struct SetThreadPinnedPayload {
     pinned: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListSkillsPayload {
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    force_reload: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetCollaborationModePayload {
+    thread_id: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetThreadGoalPayload {
+    thread_id: String,
+    objective: String,
+    #[serde(default)]
+    token_budget: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClearThreadGoalPayload {
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetThreadNamePayload {
+    thread_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThreadIdPayload {
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SelectModelPayload {
+    provider_id: String,
+    model_id: String,
+}
+
 impl WireMessage {
     /// 创建由电脑端发往手机端的协议消息。
     pub(crate) fn outbound(
@@ -233,9 +380,12 @@ impl WireMessage {
                 | "thread.detail.chunk"
                 | "thread.detail.end"
                 | "execution.status"
+                | "skills.list"
                 | "sync.progress"
                 | "request.error"
                 | "request.ack"
+                | "models.catalog"
+                | "model.selected"
         ) {
             return Err(ProtocolError::OutboundMessageNotAllowed(
                 message.message_type.clone(),
@@ -345,13 +495,71 @@ impl RemoteCommand {
                 }
                 validate_optional_identifier("model", payload.model.as_deref())?;
                 validate_optional_identifier("effort", payload.effort.as_deref())?;
+                validate_optional_policy(
+                    "approvalPolicy",
+                    payload.approval_policy.as_ref(),
+                    &["untrusted", "on-request", "never"],
+                )?;
+                validate_sandbox_policy(payload.sandbox_policy.as_ref())?;
+                validate_collaboration_mode(payload.collaboration_mode.as_deref())?;
+                validate_skills(&payload.skills)?;
                 Ok(Self::StartTurn {
                     request_id: message.request_id,
                     thread_id: payload.thread_id,
                     text: payload.text,
                     model: payload.model,
                     effort: payload.effort,
+                    approval_policy: payload.approval_policy,
+                    sandbox_policy: payload.sandbox_policy,
+                    collaboration_mode: payload.collaboration_mode,
+                    skills: payload.skills,
                     attachments: payload.attachments,
+                })
+            }
+            "turn.queue" => {
+                let payload: StartTurnPayload = parse_payload(payload)?;
+                let queue_id = payload.queue_id.ok_or_else(|| ProtocolError::InvalidPayload("queueId".to_string()))?;
+                validate_identifier("queueId", &queue_id)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                if payload.attachments.len() > MAX_ATTACHMENTS_PER_TURN {
+                    return Err(ProtocolError::InvalidPayload("attachments".to_string()));
+                }
+                for attachment in &payload.attachments {
+                    validate_attachment(attachment)?;
+                }
+                if (payload.text.trim().is_empty() && payload.attachments.is_empty())
+                    || payload.text.len() > MAX_TURN_TEXT_LENGTH
+                {
+                    return Err(ProtocolError::InvalidPayload("text".to_string()));
+                }
+                validate_optional_identifier("model", payload.model.as_deref())?;
+                validate_optional_identifier("effort", payload.effort.as_deref())?;
+                validate_optional_policy("approvalPolicy", payload.approval_policy.as_ref(), &["untrusted", "on-request", "never"])?;
+                validate_sandbox_policy(payload.sandbox_policy.as_ref())?;
+                validate_collaboration_mode(payload.collaboration_mode.as_deref())?;
+                validate_skills(&payload.skills)?;
+                Ok(Self::QueueTurn {
+                    request_id: message.request_id,
+                    queue_id,
+                    thread_id: payload.thread_id,
+                    text: payload.text,
+                    model: payload.model,
+                    effort: payload.effort,
+                    approval_policy: payload.approval_policy,
+                    sandbox_policy: payload.sandbox_policy,
+                    collaboration_mode: payload.collaboration_mode,
+                    skills: payload.skills,
+                    attachments: payload.attachments,
+                })
+            }
+            "turn.steerQueued" => {
+                let payload: SteerQueuedTurnPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                validate_identifier("queueId", &payload.queue_id)?;
+                Ok(Self::SteerQueuedTurn {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                    queue_id: payload.queue_id,
                 })
             }
             "attachment.start" => {
@@ -421,6 +629,108 @@ impl RemoteCommand {
                     pinned: payload.pinned,
                 })
             }
+            "skills.list" => {
+                let payload: ListSkillsPayload = parse_payload(payload)?;
+                validate_optional_identifier("threadId", payload.thread_id.as_deref())?;
+                validate_optional_identifier("projectId", payload.project_id.as_deref())?;
+                if payload.thread_id.is_none() && payload.project_id.is_none() {
+                    return Err(ProtocolError::InvalidPayload("threadId/projectId".to_string()));
+                }
+                Ok(Self::ListSkills {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                    project_id: payload.project_id,
+                    force_reload: payload.force_reload,
+                })
+            }
+            "thread.modeSet" => {
+                let payload: SetCollaborationModePayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                validate_collaboration_mode(Some(&payload.mode))?;
+                Ok(Self::SetCollaborationMode {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                    mode: payload.mode,
+                })
+            }
+            "thread.goalSet" => {
+                let payload: SetThreadGoalPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                let objective = payload.objective.trim();
+                if objective.is_empty() || objective.len() > MAX_GOAL_OBJECTIVE_LENGTH {
+                    return Err(ProtocolError::InvalidPayload("objective".to_string()));
+                }
+                if payload.token_budget.is_some_and(|budget| budget <= 0) {
+                    return Err(ProtocolError::InvalidPayload("tokenBudget".to_string()));
+                }
+                Ok(Self::SetThreadGoal {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                    objective: objective.to_string(),
+                    token_budget: payload.token_budget,
+                })
+            }
+            "thread.goalClear" => {
+                let payload: ClearThreadGoalPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                Ok(Self::ClearThreadGoal {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                })
+            }
+            "thread.rename" => {
+                let payload: SetThreadNamePayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                let name = payload.name.trim();
+                if name.is_empty() || name.len() > 255 {
+                    return Err(ProtocolError::InvalidPayload("name".to_string()));
+                }
+                Ok(Self::SetThreadName {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                    name: name.to_string(),
+                })
+            }
+            "thread.archive" => {
+                let payload: ThreadIdPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                Ok(Self::ArchiveThread {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                })
+            }
+            "thread.delete" => {
+                let payload: ThreadIdPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                Ok(Self::DeleteThread {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                })
+            }
+            "thread.compact" => {
+                let payload: ThreadIdPayload = parse_payload(payload)?;
+                validate_identifier("threadId", &payload.thread_id)?;
+                Ok(Self::CompactThread {
+                    request_id: message.request_id,
+                    thread_id: payload.thread_id,
+                })
+            }
+            "models.list" => {
+                ensure_empty_payload(&payload)?;
+                Ok(Self::ListModels {
+                    request_id: message.request_id,
+                })
+            }
+            "model.select" => {
+                let payload: SelectModelPayload = parse_payload(payload)?;
+                validate_identifier("providerId", &payload.provider_id)?;
+                validate_identifier("modelId", &payload.model_id)?;
+                Ok(Self::SelectModel {
+                    request_id: message.request_id,
+                    provider_id: payload.provider_id,
+                    model_id: payload.model_id,
+                })
+            }
             _ => Err(ProtocolError::CommandNotAllowed(message.message_type)),
         }
     }
@@ -453,6 +763,56 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), ProtocolError> {
 fn validate_optional_identifier(name: &str, value: Option<&str>) -> Result<(), ProtocolError> {
     if let Some(value) = value {
         validate_identifier(name, value)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_policy(
+    field: &str,
+    value: Option<&Value>,
+    allowed: &[&str],
+) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(policy) = value.as_str() else {
+        return Err(ProtocolError::InvalidPayload(field.to_string()));
+    };
+    if !allowed.contains(&policy) {
+        return Err(ProtocolError::InvalidPayload(field.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_sandbox_policy(value: Option<&Value>) -> Result<(), ProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(policy_type) = value.get("type").and_then(Value::as_str) else {
+        return Err(ProtocolError::InvalidPayload("sandboxPolicy".to_string()));
+    };
+    if !["dangerFullAccess", "readOnly", "workspaceWrite"].contains(&policy_type) {
+        return Err(ProtocolError::InvalidPayload("sandboxPolicy".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_collaboration_mode(mode: Option<&str>) -> Result<(), ProtocolError> {
+    if mode.is_some_and(|value| !["default", "plan"].contains(&value)) {
+        return Err(ProtocolError::InvalidPayload(
+            "collaborationMode".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_skills(skills: &[RemoteSkill]) -> Result<(), ProtocolError> {
+    if skills.len() > MAX_SKILLS_PER_TURN {
+        return Err(ProtocolError::InvalidPayload("skills".to_string()));
+    }
+    for skill in skills {
+        validate_identifier("skill.name", &skill.name)?;
+        validate_identifier("skill.path", &skill.path)?;
     }
     Ok(())
 }
@@ -582,6 +942,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decodes_permission_overrides() {
+        let command = RemoteCommand::decode(
+            &json!({
+                "version": 1,
+                "type": "turn.start",
+                "payload": {
+                    "threadId": "thread-1",
+                    "text": "inspect",
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": { "type": "dangerFullAccess" }
+                }
+            })
+            .to_string(),
+        )
+        .expect("decode permission overrides");
+
+        assert!(matches!(
+            command,
+            RemoteCommand::StartTurn {
+                ref approval_policy,
+                ref sandbox_policy,
+                ..
+            } if approval_policy.as_ref().and_then(Value::as_str) == Some("never")
+                && sandbox_policy
+                    .as_ref()
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("dangerFullAccess")
+        ));
+    }
     #[test]
     fn decodes_incremental_sync_revisions() {
         let command = RemoteCommand::decode(

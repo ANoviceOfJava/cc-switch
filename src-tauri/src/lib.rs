@@ -1136,10 +1136,10 @@ pub fn run() {
                 app.handle().clone(),
             );
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
-            app.manage(app_state);
+            app.manage(app_state.clone());
 
             // Remote 配置只保存在当前电脑；启用后随 CC Switch 自动恢复代理。
-            let remote_control_state = remote_control::RemoteControlState::new();
+            let remote_control_state = remote_control::RemoteControlState::new(app_state);
             app.manage(remote_control_state.clone());
             tauri::async_runtime::spawn(async move {
                 remote_control_state.start_saved().await;

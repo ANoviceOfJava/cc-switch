@@ -29,3 +29,8 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+# Remote control local probes and standalone build outputs
+.tmp-probe/
+.tmp-probe2/
+src-tauri/target-queue/
+src-tauri/target-standalone/

@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
@@ -13,27 +14,34 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::app_server::{AppServerClient, AppServerError, AppServerEvent};
-use super::desktop_control::{self, DesktopControlError};
+use super::desktop_control;
 use super::project_state::{
     assign_thread_to_project, load_codex_project_state, set_thread_pinned, CodexProject,
     CodexProjectState, ProjectStateError,
 };
 use super::protocol::{
-    ApprovalDecision, KnownThreadRevision, ProtocolError, RemoteAttachment, RemoteCommand,
+    ApprovalDecision, KnownThreadRevision, ProtocolError, RemoteAttachment, RemoteCommand, RemoteSkill,
     WireMessage,
 };
 use super::relay_client::{RelayClient, RelayError, RelayEvent};
+use crate::app_config::AppType;
+use crate::provider::Provider;
+use crate::services::{model_fetch, ProviderService};
 use crate::session_manager::providers::codex::{
     latest_message_timestamp, latest_thread_context_usage, latest_thread_execution_state,
     latest_thread_settings, load_message_attachments, load_messages, scan_sessions, session_roots,
     ThreadExecutionState,
 };
+use crate::store::AppState;
 
 const PAGE_SIZE: u32 = 100;
 const MAX_PAGES: usize = 100;
 const DETAIL_CHUNK_CHARS: usize = 180_000;
 const STATUS_POLL_LIMIT: u32 = 50;
 const THREAD_DETAIL_PAGE_SIZE: usize = 5;
+const MODEL_CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_MODELS_PER_PROVIDER: usize = 5;
 
 #[derive(Debug, Error)]
 pub(crate) enum RemoteAgentError {
@@ -65,8 +73,7 @@ pub(crate) enum RemoteAgentError {
     Io(#[from] std::io::Error),
     #[error("附件数据不是有效 Base64: {0}")]
     Base64(#[from] base64::DecodeError),
-    #[error("无法通过 Codex 桌面端发送消息: {0}")]
-    DesktopControl(#[from] DesktopControlError),
+
 }
 
 pub(crate) struct RemoteControlAgent {
@@ -76,6 +83,7 @@ pub(crate) struct RemoteControlAgent {
 }
 
 struct AgentRuntime {
+    app_state: AppState,
     app_server: AppServerClient,
     relay: RelayClient,
     known_thread_ids: HashSet<String>,
@@ -84,6 +92,7 @@ struct AgentRuntime {
     fresh_thread_ids: HashSet<String>,
     thread_session_paths: HashMap<String, PathBuf>,
     thread_settings: HashMap<String, ThreadSettings>,
+    thread_goals: HashMap<String, ThreadGoalDto>,
     thread_context_usage: HashMap<String, ContextUsageDto>,
     thread_reasoning_activity: HashMap<String, String>,
     attachment_dir: tempfile::TempDir,
@@ -93,15 +102,100 @@ struct AgentRuntime {
     app_server_restart_requested: bool,
     pending_approvals: HashMap<String, PendingApproval>,
     last_detail_thread_id: Option<String>,
+    detail_turn_cache: Option<DetailTurnCache>,
+    model_catalog_cache: Option<ModelCatalogCache>,
     last_snapshot: Option<StateSnapshotDto>,
     /// 桌面端自动化发送后、会话文件尚未落盘期间的乐观消息。
     pending_user_messages: HashMap<String, Vec<ConversationItemDto>>,
+    /// 当前执行不允许同轮插入时，等待本轮完成后再发送的消息。
+    queued_turn_messages: Vec<QueuedTurnMessage>,
+}
+#[derive(Clone)]
+struct QueuedTurnMessage {
+    id: String,
+    thread_id: String,
+    text: String,
+    model: Option<String>,
+    effort: Option<String>,
+    approval_policy: Option<Value>,
+    sandbox_policy: Option<Value>,
+    collaboration_mode: Option<String>,
+    skills: Vec<RemoteSkill>,
+    attachments: Vec<RemoteAttachment>,
 }
 
 #[derive(Clone)]
 struct ThreadSettings {
     model: Option<String>,
     effort: Option<String>,
+    collaboration_mode: Option<String>,
+}
+
+struct DetailTurnCache {
+    thread_id: String,
+    updated_at: i64,
+    turns: Vec<Vec<ConversationItemDto>>,
+}
+
+struct ModelCatalogCache {
+    fetched_at: Instant,
+    current_provider_id: Option<String>,
+    models: Vec<ModelDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSkillListResponse {
+    data: Vec<RawSkillListEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSkillListEntry {
+    skills: Vec<RawSkill>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSkill {
+    name: String,
+    description: String,
+    enabled: bool,
+    path: String,
+    scope: String,
+    short_description: Option<String>,
+    interface: Option<RawSkillInterface>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSkillInterface {
+    display_name: Option<String>,
+    short_description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillDto {
+    name: String,
+    display_name: Option<String>,
+    description: String,
+    short_description: Option<String>,
+    path: String,
+    scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGoalDto {
+    objective: String,
+    status: String,
+    #[serde(default)]
+    token_budget: Option<i64>,
+    #[serde(default)]
+    tokens_used: i64,
+    #[serde(default)]
+    time_used_seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -152,6 +246,8 @@ struct RawThread {
     updated_at: i64,
     status: ThreadStatusDto,
     #[serde(default)]
+    parent_thread_id: Option<String>,
+    #[serde(default)]
     turns: Vec<RawTurn>,
 }
 
@@ -201,6 +297,7 @@ struct StateSnapshotDto {
     generated_at: i64,
     projects: Vec<CodexProject>,
     threads: Vec<ThreadSummaryDto>,
+    thread_signatures: Vec<KnownThreadRevision>,
     models: Vec<ModelDto>,
     deleted_thread_ids: Vec<String>,
 }
@@ -212,6 +309,7 @@ struct StateDeltaDto {
     generated_at: i64,
     projects: Vec<CodexProject>,
     threads: Vec<ThreadSummaryDto>,
+    thread_signatures: Vec<KnownThreadRevision>,
     thread_order: Vec<String>,
     models: Vec<ModelDto>,
     deleted_thread_ids: Vec<String>,
@@ -229,6 +327,7 @@ struct ThreadSummaryDto {
     updated_at: i64,
     status: ThreadStatusDto,
     pinned: bool,
+    parent_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -259,6 +358,14 @@ struct ModelDto {
     is_default: bool,
     default_reasoning_effort: Option<String>,
     supported_reasoning_efforts: Vec<ReasoningEffortDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_icon: Option<String>,
+    #[serde(default)]
+    current_provider: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +374,15 @@ struct ReasoningEffortDto {
     reasoning_effort: String,
     description: Option<String>,
 }
+
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedMessageDto {
+    id: String,
+    text: String,
+}
+
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,10 +394,13 @@ struct ThreadDetailDto {
     active_turn_id: Option<String>,
     selected_model: Option<String>,
     selected_reasoning_effort: Option<String>,
+    collaboration_mode: Option<String>,
+    goal: Option<ThreadGoalDto>,
     context_usage: Option<ContextUsageDto>,
     before: usize,
     has_more_before: bool,
     next_before: Option<usize>,
+    queued_messages: Vec<QueuedMessageDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,6 +470,7 @@ impl RemoteControlAgent {
     pub(crate) async fn start(
         relay_url: &str,
         access_key: String,
+        app_state: AppState,
     ) -> Result<Self, RemoteAgentError> {
         let app_server = AppServerClient::start().await?;
         let relay = match RelayClient::start(relay_url, access_key) {
@@ -365,6 +485,7 @@ impl RemoteControlAgent {
             .prefix("codex-remote-attachments-")
             .tempdir()?;
         let runtime = AgentRuntime {
+            app_state,
             app_server,
             relay,
             known_thread_ids: HashSet::new(),
@@ -373,6 +494,7 @@ impl RemoteControlAgent {
             fresh_thread_ids: HashSet::new(),
             thread_session_paths: HashMap::new(),
             thread_settings: HashMap::new(),
+            thread_goals: HashMap::new(),
             thread_context_usage: HashMap::new(),
             thread_reasoning_activity: HashMap::new(),
             attachment_dir,
@@ -382,8 +504,11 @@ impl RemoteControlAgent {
             app_server_restart_requested: false,
             pending_approvals: HashMap::new(),
             last_detail_thread_id: None,
+            detail_turn_cache: None,
+            model_catalog_cache: None,
             last_snapshot: None,
             pending_user_messages: HashMap::new(),
+            queued_turn_messages: Vec::new(),
         };
         let relay_status = runtime.relay.clone();
         let task = tokio::spawn(runtime.run(shutdown_rx));
@@ -496,12 +621,12 @@ impl AgentRuntime {
                 self.send_incremental_snapshot(known_threads).await
             }
             RemoteCommand::ReadThread {
+                request_id: read_request_id,
                 thread_id,
                 before,
                 limit,
-                ..
             } => {
-                self.send_thread_detail(&thread_id, before, limit).await
+                self.send_thread_detail(&thread_id, before, limit, read_request_id).await
             }
             RemoteCommand::CreateThread {
                 request_id,
@@ -512,12 +637,58 @@ impl AgentRuntime {
                 text,
                 model,
                 effort,
+                approval_policy,
+                sandbox_policy,
+                collaboration_mode,
+                skills,
                 attachments,
                 ..
             } => {
-                self.start_turn(&thread_id, text, model, effort, attachments)
-                    .await
+                self.start_turn(
+                    &thread_id,
+                    text,
+                    model,
+                    effort,
+                    approval_policy,
+                    sandbox_policy,
+                    collaboration_mode,
+                    skills,
+                    attachments,
+                )
+                .await
             }
+            RemoteCommand::QueueTurn {
+                request_id: _,
+                queue_id,
+                thread_id,
+                text,
+                model,
+                effort,
+                approval_policy,
+                sandbox_policy,
+                collaboration_mode,
+                skills,
+                attachments,
+            } => {
+                self.queue_turn_message(QueuedTurnMessage {
+                    id: queue_id,
+                    thread_id,
+                    text,
+                    model,
+                    effort,
+                    approval_policy,
+                    sandbox_policy,
+                    collaboration_mode,
+                    skills,
+                    attachments,
+                })
+                .await
+            }
+            RemoteCommand::SteerQueuedTurn {
+                thread_id,
+                queue_id,
+                ..
+            } => self.steer_queued_turn(&thread_id, &queue_id).await,
             RemoteCommand::StartAttachmentUpload {
                 upload_id,
                 name,
@@ -548,6 +719,48 @@ impl AgentRuntime {
             RemoteCommand::SetThreadPinned {
                 thread_id, pinned, ..
             } => self.set_thread_pinned(&thread_id, pinned).await,
+            RemoteCommand::ListSkills {
+                thread_id,
+                project_id,
+                force_reload,
+                ..
+            } => {
+                self.list_skills(thread_id.as_deref(), project_id.as_deref(), force_reload)
+                    .await
+            }
+            RemoteCommand::SetCollaborationMode {
+                thread_id, mode, ..
+            } => self.set_collaboration_mode(&thread_id, &mode).await,
+            RemoteCommand::SetThreadGoal {
+                thread_id,
+                objective,
+                token_budget,
+                ..
+            } => self.set_thread_goal(&thread_id, objective, token_budget).await,
+            RemoteCommand::ClearThreadGoal { thread_id, .. } => {
+                self.clear_thread_goal(&thread_id).await
+            }
+            RemoteCommand::SetThreadName {
+                thread_id, name, ..
+            } => self.set_thread_name(&thread_id, name).await,
+            RemoteCommand::ArchiveThread { thread_id, .. } => {
+                self.archive_thread(&thread_id).await
+            }
+            RemoteCommand::DeleteThread { thread_id, .. } => self.delete_thread(&thread_id).await,
+            RemoteCommand::CompactThread { thread_id, .. } => {
+                self.compact_thread(&thread_id).await
+            }
+            RemoteCommand::ListModels { request_id } => {
+                self.send_model_catalog(request_id).await
+            }
+            RemoteCommand::SelectModel {
+                request_id,
+                provider_id,
+                model_id,
+            } => {
+                self.select_provider_model(request_id, &provider_id, &model_id)
+                    .await
+            }
         };
 
         if let Err(error) = &result {
@@ -588,6 +801,56 @@ impl AgentRuntime {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 match method.as_str() {
+                    "thread/settings/updated" => {
+                        let Some(thread_id) = thread_id else {
+                            return Ok(());
+                        };
+                        let settings = params.get("threadSettings").ok_or_else(|| {
+                            RemoteAgentError::Incompatible(
+                                "thread/settings/updated 缺少 threadSettings".to_string(),
+                            )
+                        })?;
+                        let current = self.thread_settings.entry(thread_id.clone()).or_insert(
+                            ThreadSettings {
+                                model: None,
+                                effort: None,
+                                collaboration_mode: None,
+                            },
+                        );
+                        if let Some(model) = settings.get("model").and_then(Value::as_str) {
+                            current.model = Some(model.to_string());
+                        }
+                        current.effort = settings
+                            .get("effort")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        current.collaboration_mode = settings
+                            .pointer("/collaborationMode/mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        self.send_current_thread_detail(&thread_id).await?;
+                    }
+                    "thread/goal/updated" => {
+                        let Some(thread_id) = thread_id else {
+                            return Ok(());
+                        };
+                        let goal: ThreadGoalDto = serde_json::from_value(
+                            params.get("goal").cloned().ok_or_else(|| {
+                                RemoteAgentError::Incompatible(
+                                    "thread/goal/updated 缺少 goal".to_string(),
+                                )
+                            })?,
+                        )?;
+                        self.thread_goals.insert(thread_id.clone(), goal);
+                        self.send_current_thread_detail(&thread_id).await?;
+                    }
+                    "thread/goal/cleared" => {
+                        let Some(thread_id) = thread_id else {
+                            return Ok(());
+                        };
+                        self.thread_goals.remove(&thread_id);
+                        self.send_current_thread_detail(&thread_id).await?;
+                    }
                     "thread/tokenUsage/updated" => {
                         let Some(thread_id) = thread_id else {
                             return Ok(());
@@ -655,11 +918,8 @@ impl AgentRuntime {
                                 self.thread_reasoning_activity.remove(thread_id);
                                 self.send_execution_status(thread_id, "completed", "任务已完成")
                                     .await?;
-                                if self.remote_turn_thread_ids.remove(thread_id)
-                                    && self.remote_turn_thread_ids.is_empty()
-                                {
-                                    self.app_server_restart_requested = true;
-                                }
+                                self.release_thread_writer(thread_id).await;
+                                self.flush_queued_turn_message(thread_id).await?;
                             }
                         }
                         self.send_snapshot_silent().await?;
@@ -771,15 +1031,17 @@ impl AgentRuntime {
 
         let mut changed_threads = Vec::new();
         for thread in &snapshot.threads {
-            let signature = serde_json::to_string(thread)?;
+            let signature = thread_signature(thread);
             if known_by_id.get(&thread.id) != Some(&signature) {
                 changed_threads.push(thread.clone());
             }
         }
+        let thread_signatures = known_thread_revisions(&snapshot.threads);
         let delta = StateDeltaDto {
             revision: snapshot.revision,
             generated_at: snapshot.generated_at,
             projects: snapshot.projects,
+            thread_signatures,
             thread_order: snapshot
                 .threads
                 .iter()
@@ -953,6 +1215,7 @@ impl AgentRuntime {
                 created_at: thread.created_at,
                 updated_at: thread.updated_at,
                 status: thread.status,
+                parent_thread_id: thread.parent_thread_id,
             });
         }
 
@@ -987,14 +1250,20 @@ impl AgentRuntime {
                         description: Some(effort.description),
                     })
                     .collect(),
+                provider_id: None,
+                provider_name: None,
+                provider_icon: None,
+                current_provider: false,
             })
             .collect();
 
+        let thread_signatures = known_thread_revisions(&threads);
         Ok(StateSnapshotDto {
             revision: Uuid::new_v4().to_string(),
             generated_at: unix_time_millis(),
             projects: project_state.projects,
             threads,
+            thread_signatures,
             models,
             deleted_thread_ids,
         })
@@ -1083,6 +1352,9 @@ impl AgentRuntime {
             };
             self.send_execution_status(thread_id, phase, message)
                 .await?;
+            if matches!(state, ThreadExecutionState::Idle) {
+                self.release_thread_writer(thread_id).await;
+            }
         }
         self.send_cached_snapshot().await?;
         if let Some(thread_id) = self.last_detail_thread_id.clone() {
@@ -1090,7 +1362,7 @@ impl AgentRuntime {
                 .iter()
                 .any(|(changed_id, _)| changed_id == &thread_id)
             {
-                self.send_thread_detail(&thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+                self.send_thread_detail(&thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
                     .await?;
             }
         }
@@ -1170,12 +1442,144 @@ impl AgentRuntime {
         )))
     }
 
+    async fn release_previous_detail_thread(&mut self, current_thread_id: &str) {
+        let Some(previous) = self
+            .last_detail_thread_id
+            .clone()
+            .filter(|thread_id| thread_id != current_thread_id)
+        else {
+            return;
+        };
+        if self.remote_turn_thread_ids.contains(&previous) {
+            return;
+        }
+        self.last_detail_thread_id = None;
+        let _ = self
+            .app_server
+            .request("thread/unsubscribe", json!({ "threadId": previous }))
+            .await;
+    }
+
+    async fn release_thread_writer(&mut self, thread_id: &str) {
+        if !self.remote_turn_thread_ids.remove(thread_id) {
+            return;
+        }
+        match self
+            .app_server
+            .request("thread/unsubscribe", json!({ "threadId": thread_id }))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!(
+                    "Failed to unsubscribe thread {thread_id}; restarting app-server to release writer lock: {error}"
+                );
+                self.app_server_restart_requested = true;
+            }
+        }
+    }
+
+    fn queued_messages_for(&self, thread_id: &str) -> Vec<QueuedMessageDto> {
+        self.queued_turn_messages
+            .iter()
+            .filter(|message| message.thread_id == thread_id)
+            .map(|message| QueuedMessageDto {
+                id: message.id.clone(),
+                text: message.text.clone(),
+            })
+            .collect()
+    }
+
+
+    async fn send_model_catalog(
+        &mut self,
+        request_id: Option<String>,
+    ) -> Result<(), RemoteAgentError> {
+        let now = Instant::now();
+        let cached = self
+            .model_catalog_cache
+            .as_ref()
+            .filter(|cache| now.duration_since(cache.fetched_at) < MODEL_CATALOG_TTL)
+            .map(|cache| (cache.current_provider_id.clone(), cache.models.clone()));
+        let (current_provider_id, models) = match cached {
+            Some(cached) => cached,
+            None => {
+                let built = build_model_catalog(&self.app_state).await?;
+                self.model_catalog_cache = Some(ModelCatalogCache {
+                    fetched_at: now,
+                    current_provider_id: built.0.clone(),
+                    models: built.1.clone(),
+                });
+                built
+            }
+        };
+        self.relay
+            .send(WireMessage::outbound(
+                "models.catalog",
+                request_id,
+                Some(json!({
+                    "currentProviderId": current_provider_id,
+                    "models": models,
+                })),
+            )?)
+            .await?;
+        Ok(())
+    }
+
+    async fn select_provider_model(
+        &mut self,
+        request_id: Option<String>,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<(), RemoteAgentError> {
+        let mut provider = self
+            .app_state
+            .db
+            .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            .map_err(|error| RemoteAgentError::Incompatible(error.to_string()))?
+            .ok_or_else(|| RemoteAgentError::ProjectNotFound(provider_id.to_string()))?;
+        let config = provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RemoteAgentError::Incompatible("供应商缺少 Codex config".to_string()))?;
+        let updated = crate::codex_config::update_codex_toml_field(config, "model", model_id)
+            .map_err(RemoteAgentError::Incompatible)?;
+        let settings = provider
+            .settings_config
+            .as_object_mut()
+            .ok_or_else(|| RemoteAgentError::Incompatible("供应商配置不是对象".to_string()))?;
+        settings.insert("config".to_string(), Value::String(updated));
+        self.app_state
+            .db
+            .save_provider(AppType::Codex.as_str(), &provider)
+            .map_err(|error| RemoteAgentError::Incompatible(error.to_string()))?;
+        ProviderService::switch(&self.app_state, AppType::Codex, provider_id)
+            .map_err(|error| RemoteAgentError::Incompatible(error.to_string()))?;
+        self.app_server_restart_requested = true;
+        self.model_catalog_cache = None;
+        self.relay
+            .send(WireMessage::outbound(
+                "model.selected",
+                request_id,
+                Some(json!({
+                    "providerId": provider_id,
+                    "modelId": model_id,
+                })),
+            )?)
+            .await?;
+        self.send_snapshot().await?;
+        Ok(())
+    }
+
     async fn send_thread_detail(
         &mut self,
         thread_id: &str,
         before: usize,
         limit: usize,
+        request_id: Option<String>,
     ) -> Result<(), RemoteAgentError> {
+        self.release_previous_detail_thread(thread_id).await;
         if !self.thread_summaries.contains_key(thread_id) {
             self.build_snapshot().await?;
         }
@@ -1193,6 +1597,7 @@ impl AgentRuntime {
                 created_at: unix_time_millis(),
                 updated_at: unix_time_millis(),
                 status: ThreadStatusDto::NotLoaded,
+                parent_thread_id: None,
             });
         if self.fresh_thread_ids.contains(thread_id) {
             let selected_model = self
@@ -1203,6 +1608,10 @@ impl AgentRuntime {
                 .thread_settings
                 .get(thread_id)
                 .and_then(|settings| settings.effort.clone());
+            let collaboration_mode = self
+                .thread_settings
+                .get(thread_id)
+                .and_then(|settings| settings.collaboration_mode.clone());
             let detail = ThreadDetailDto {
                 revision: Uuid::new_v4().to_string(),
                 generated_at: unix_time_millis(),
@@ -1211,20 +1620,61 @@ impl AgentRuntime {
                 active_turn_id: None,
                 selected_model,
                 selected_reasoning_effort,
+                collaboration_mode,
+                goal: self.thread_goals.get(thread_id).cloned(),
                 context_usage: self.thread_context_usage.get(thread_id).copied(),
                 before,
                 has_more_before: false,
                 next_before: None,
+                queued_messages: self.queued_messages_for(thread_id),
             };
-            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?).await?;
+            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone()).await?;
             self.last_detail_thread_id = Some(thread_id.to_string());
             return Ok(());
+        }
+        if before > 0 {
+            if let Some((items, has_more_before, next_before)) =
+                self.paginate_cached_detail(thread_id, summary.updated_at, before, limit)
+            {
+                let settings = self.thread_settings.get(thread_id);
+                let detail = ThreadDetailDto {
+                    revision: Uuid::new_v4().to_string(),
+                    generated_at: unix_time_millis(),
+                    thread: summary,
+                    items,
+                    active_turn_id: None,
+                    selected_model: settings.and_then(|settings| settings.model.clone()),
+                    selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+                    collaboration_mode: settings
+                        .and_then(|settings| settings.collaboration_mode.clone()),
+                    goal: self.thread_goals.get(thread_id).cloned(),
+                    context_usage: self.thread_context_usage.get(thread_id).copied(),
+                    before,
+                    has_more_before,
+                    next_before,
+                    queued_messages: self.queued_messages_for(thread_id),
+                };
+                self.send_thread_detail_payload(
+                    thread_id,
+                    serde_json::to_value(detail)?,
+                    request_id.clone(),
+                )
+                .await?;
+                self.last_detail_thread_id = Some(thread_id.to_string());
+                return Ok(());
+            }
         }
         if let Some((items, local_model, local_effort, local_context_usage)) =
             load_local_thread_detail(thread_id)
         {
             let items = self.merge_pending_user_messages(thread_id, items);
-            let (items, has_more_before, next_before) = paginate_conversation_items(items, before, limit);
+            let turns = group_conversation_items_into_turns(items);
+            self.cache_detail_turns(thread_id, summary.updated_at, turns.clone());
+            let (items, has_more_before, next_before) =
+                paginate_conversation_turns(&turns, before, limit);
+            if let Some(usage) = local_context_usage {
+                self.thread_context_usage.insert(thread_id.to_string(), usage);
+            }
             let settings = self.thread_settings.get(thread_id);
             let detail = ThreadDetailDto {
                 revision: Uuid::new_v4().to_string(),
@@ -1236,13 +1686,17 @@ impl AgentRuntime {
                     .or_else(|| settings.and_then(|settings| settings.model.clone())),
                 selected_reasoning_effort: local_effort
                     .or_else(|| settings.and_then(|settings| settings.effort.clone())),
+                collaboration_mode: settings
+                    .and_then(|settings| settings.collaboration_mode.clone()),
+                goal: self.thread_goals.get(thread_id).cloned(),
                 context_usage: local_context_usage
                     .or_else(|| self.thread_context_usage.get(thread_id).copied()),
                 before,
                 has_more_before,
                 next_before,
+                queued_messages: self.queued_messages_for(thread_id),
             };
-            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?)
+            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone())
                 .await?;
             self.last_detail_thread_id = Some(thread_id.to_string());
             return Ok(());
@@ -1281,12 +1735,16 @@ impl AgentRuntime {
                     active_turn_id: None,
                     selected_model: settings.and_then(|settings| settings.model.clone()),
                     selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+                    collaboration_mode: settings
+                        .and_then(|settings| settings.collaboration_mode.clone()),
+                    goal: self.thread_goals.get(thread_id).cloned(),
                     context_usage: self.thread_context_usage.get(thread_id).copied(),
                     before,
                     has_more_before: false,
                     next_before: None,
+                        queued_messages: self.queued_messages_for(thread_id),
                 };
-                self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?).await?;
+                self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone()).await?;
                 self.last_detail_thread_id = Some(thread_id.to_string());
                 return Ok(());
             }
@@ -1310,8 +1768,10 @@ impl AgentRuntime {
         let mut items = normalize_conversation_items(&raw_thread.turns);
         items = self.merge_pending_user_messages(thread_id, items);
         append_pending_approvals(&mut items, thread_id, &self.pending_approvals);
+        let turns = group_conversation_items_into_turns(items);
+        self.cache_detail_turns(thread_id, summary.updated_at, turns.clone());
         let (items, has_more_before, next_before) =
-            paginate_conversation_items(items, before, limit);
+            paginate_conversation_turns(&turns, before, limit);
         let settings = self.thread_settings.get(thread_id);
         let detail = ThreadDetailDto {
             revision: Uuid::new_v4().to_string(),
@@ -1329,13 +1789,17 @@ impl AgentRuntime {
             active_turn_id,
             selected_model: settings.and_then(|settings| settings.model.clone()),
             selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+            collaboration_mode: settings
+                .and_then(|settings| settings.collaboration_mode.clone()),
+            goal: self.thread_goals.get(thread_id).cloned(),
             context_usage: self.thread_context_usage.get(thread_id).copied(),
             before,
             has_more_before,
             next_before,
+            queued_messages: self.queued_messages_for(thread_id),
         };
         let payload = serde_json::to_value(detail)?;
-        self.send_thread_detail_payload(thread_id, payload).await?;
+        self.send_thread_detail_payload(thread_id, payload, request_id.clone()).await?;
         self.last_detail_thread_id = Some(thread_id.to_string());
         Ok(())
     }
@@ -1370,11 +1834,12 @@ impl AgentRuntime {
         &mut self,
         thread_id: &str,
         payload: Value,
+        request_id: Option<String>,
     ) -> Result<(), RemoteAgentError> {
         let encoded = serde_json::to_string(&payload)?;
         if encoded.chars().count() <= DETAIL_CHUNK_CHARS {
             self.relay
-                .send(WireMessage::outbound("thread.detail", None, Some(payload))?)
+                .send(WireMessage::outbound("thread.detail", request_id.clone(), Some(payload))?)
                 .await?;
             return Ok(());
         }
@@ -1390,7 +1855,7 @@ impl AgentRuntime {
         self.relay
             .send(WireMessage::outbound(
                 "thread.detail.start",
-                None,
+                request_id.clone(),
                 Some(json!({ "transferId": transfer_id, "threadId": thread_id, "total": total })),
             )?)
             .await?;
@@ -1398,7 +1863,7 @@ impl AgentRuntime {
             self.relay
                 .send(WireMessage::outbound(
                     "thread.detail.chunk",
-                    None,
+                    request_id.clone(),
                     Some(json!({
                         "transferId": transfer_id,
                         "threadId": thread_id,
@@ -1412,7 +1877,7 @@ impl AgentRuntime {
         self.relay
             .send(WireMessage::outbound(
                 "thread.detail.end",
-                None,
+                request_id.clone(),
                 Some(json!({ "transferId": transfer_id, "threadId": thread_id, "total": total })),
             )?)
             .await?;
@@ -1508,21 +1973,14 @@ impl AgentRuntime {
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
                     .unwrap_or(ThreadStatusDto::NotLoaded),
+                parent_thread_id: thread_value
+                    .get("parentThreadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             },
         );
         self.fresh_thread_ids.insert(thread_id.to_string());
-        // App Server 的 thread/start 成功后，thread/list 可能短暂尚未返回新任务。
-        // 等待它进入内存索引，避免前端收到创建确认后立刻发送 turn.start 却被误判为不存在。
-        if !self.thread_summaries.contains_key(thread_id) {
-            for _ in 0..10 {
-                self.build_snapshot().await?;
-                if self.thread_summaries.contains_key(thread_id) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-        self.send_snapshot_silent().await?;
+        // 先确认创建结果，避免 snapshot 较慢或失败时手机端一直停留在新对话页。
         self.relay
             .send(WireMessage::outbound(
                 "request.ack",
@@ -1534,6 +1992,9 @@ impl AgentRuntime {
                 })),
             )?)
             .await?;
+        if let Err(error) = self.send_snapshot_silent().await {
+            log::warn!("Thread {thread_id} created but snapshot send failed: {error}");
+        }
         // 远程 Agent 与桌面端 UI 使用不同的刷新通道；唤起新任务可让桌面端
         // 立即重新加载任务列表并显示刚创建的会话。
         let desktop_thread_id = thread_id.to_string();
@@ -1559,12 +2020,238 @@ impl AgentRuntime {
         self.send_snapshot_silent().await
     }
 
+    async fn list_skills(
+        &mut self,
+        thread_id: Option<&str>,
+        project_id: Option<&str>,
+        force_reload: bool,
+    ) -> Result<(), RemoteAgentError> {
+        if self.thread_summaries.is_empty() {
+            self.build_snapshot().await?;
+        }
+        let cwd = if let Some(thread_id) = thread_id {
+            self.thread_summaries
+                .get(thread_id)
+                .map(|thread| thread.cwd.clone())
+        } else if let Some(project_id) = project_id {
+            self.projects
+                .get(project_id)
+                .and_then(|project| project.root_paths.first())
+                .cloned()
+        } else {
+            None
+        }
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RemoteAgentError::ProjectDirectoryMissing("skills".to_string()))?;
+
+        let response: RawSkillListResponse = serde_json::from_value(
+            self.app_server
+                .request(
+                    "skills/list",
+                    json!({ "cwds": [cwd], "forceReload": force_reload }),
+                )
+                .await?,
+        )?;
+        let mut seen = HashSet::new();
+        let mut skills = response
+            .data
+            .into_iter()
+            .flat_map(|entry| entry.skills)
+            .filter(|skill| skill.enabled)
+            .filter_map(|skill| {
+                let key = format!("{}:{}", skill.name, skill.path);
+                seen.insert(key).then_some(SkillDto {
+                    display_name: skill
+                        .interface
+                        .as_ref()
+                        .and_then(|interface| interface.display_name.clone()),
+                    short_description: skill
+                        .interface
+                        .as_ref()
+                        .and_then(|interface| interface.short_description.clone())
+                        .or(skill.short_description),
+                    name: skill.name,
+                    description: skill.description,
+                    path: skill.path,
+                    scope: skill.scope,
+                })
+            })
+            .collect::<Vec<_>>();
+        skills.sort_by(|left, right| {
+            left.display_name
+                .as_deref()
+                .unwrap_or(&left.name)
+                .to_lowercase()
+                .cmp(&right.display_name.as_deref().unwrap_or(&right.name).to_lowercase())
+        });
+        self.relay
+            .send(WireMessage::outbound(
+                "skills.list",
+                None,
+                Some(json!({ "skills": skills })),
+            )?)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_collaboration_mode(
+        &mut self,
+        thread_id: &str,
+        mode: &str,
+    ) -> Result<(), RemoteAgentError> {
+        if !self.thread_summaries.contains_key(thread_id) {
+            self.build_snapshot().await?;
+        }
+        let model = self
+            .thread_settings
+            .get(thread_id)
+            .and_then(|settings| settings.model.clone())
+            .or_else(|| {
+                self.last_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .models
+                            .iter()
+                            .find(|model| model.is_default)
+                            .or_else(|| snapshot.models.first())
+                    })
+                    .map(|model| model.id.clone())
+            })
+            .ok_or_else(|| {
+                RemoteAgentError::Incompatible("计划模式缺少可用的模型".to_string())
+            })?;
+        let effort = self
+            .thread_settings
+            .get(thread_id)
+            .and_then(|settings| settings.effort.clone());
+        let mut settings = Map::new();
+        settings.insert("model".to_string(), json!(model));
+        if let Some(effort) = effort {
+            settings.insert("reasoning_effort".to_string(), json!(effort));
+        }
+        self.app_server
+            .request(
+                "thread/settings/update",
+                json!({
+                    "threadId": thread_id,
+                    "collaborationMode": {
+                        "mode": mode,
+                        "settings": Value::Object(settings),
+                    },
+                }),
+            )
+            .await?;
+        let current = self
+            .thread_settings
+            .entry(thread_id.to_string())
+            .or_insert(ThreadSettings {
+                model: None,
+                effort: None,
+                collaboration_mode: None,
+            });
+        current.collaboration_mode = Some(mode.to_string());
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+            .await
+    }
+
+    async fn set_thread_goal(
+        &mut self,
+        thread_id: &str,
+        objective: String,
+        token_budget: Option<i64>,
+    ) -> Result<(), RemoteAgentError> {
+        if !self.thread_summaries.contains_key(thread_id) {
+            self.build_snapshot().await?;
+        }
+        let response = self
+            .app_server
+            .request(
+                "thread/goal/set",
+                json!({
+                    "threadId": thread_id,
+                    "objective": objective,
+                    "status": "active",
+                    "tokenBudget": token_budget,
+                }),
+            )
+            .await?;
+        let goal: ThreadGoalDto = serde_json::from_value(
+            response.get("goal").cloned().ok_or_else(|| {
+                RemoteAgentError::Incompatible("thread/goal/set 缺少 goal".to_string())
+            })?,
+        )?;
+        self.thread_goals.insert(thread_id.to_string(), goal);
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+            .await
+    }
+
+    async fn clear_thread_goal(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
+        self.app_server
+            .request("thread/goal/clear", json!({ "threadId": thread_id }))
+            .await?;
+        self.thread_goals.remove(thread_id);
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+            .await
+    }
+
+    async fn set_thread_name(
+        &mut self,
+        thread_id: &str,
+        name: String,
+    ) -> Result<(), RemoteAgentError> {
+        self.app_server
+            .request(
+                "thread/name/set",
+                json!({ "threadId": thread_id, "name": name }),
+            )
+            .await?;
+        if let Some(thread) = self.thread_summaries.get_mut(thread_id) {
+            thread.name = Some(name);
+            thread.updated_at = unix_time_millis();
+        }
+        self.send_snapshot_silent().await?;
+        self.send_current_thread_detail(thread_id).await
+    }
+
+    async fn archive_thread(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
+        self.app_server
+            .request("thread/archive", json!({ "threadId": thread_id }))
+            .await?;
+        self.thread_summaries.remove(thread_id);
+        self.thread_session_paths.remove(thread_id);
+        self.remote_turn_thread_ids.remove(thread_id);
+        self.send_snapshot_silent().await
+    }
+
+    async fn delete_thread(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
+        self.app_server
+            .request("thread/delete", json!({ "threadId": thread_id }))
+            .await?;
+        self.thread_summaries.remove(thread_id);
+        self.thread_session_paths.remove(thread_id);
+        self.remote_turn_thread_ids.remove(thread_id);
+        self.send_snapshot_silent().await
+    }
+
+    async fn compact_thread(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
+        self.app_server
+            .request("thread/compact/start", json!({ "threadId": thread_id }))
+            .await?;
+        self.send_execution_status(thread_id, "thinking", "正在压缩上下文")
+            .await
+    }
+
     async fn start_turn(
         &mut self,
         thread_id: &str,
         text: String,
         model: Option<String>,
         effort: Option<String>,
+        approval_policy: Option<Value>,
+        sandbox_policy: Option<Value>,
+        collaboration_mode: Option<String>,
+        skills: Vec<RemoteSkill>,
         attachments: Vec<RemoteAttachment>,
     ) -> Result<(), RemoteAgentError> {
         self.send_execution_status(thread_id, "starting", "正在启动任务")
@@ -1599,6 +2286,20 @@ impl AgentRuntime {
         if let Some(model) = &model {
             resume_params.insert("model".to_string(), json!(model));
         }
+        if let Some(summary) = self.thread_summaries.get(thread_id) {
+            if !summary.cwd.trim().is_empty() {
+                resume_params.insert("cwd".to_string(), json!(summary.cwd));
+            }
+        }
+        // App Server 的索引可能在重启或迁移后暂时丢失，但 rollout 文件仍在。
+        // 指定 path 可以直接从本地会话恢复，避免手机端继续使用旧任务时报
+        // “thread not found”。
+        if let Some(session_path) = find_session_file(&session_roots(), thread_id) {
+            resume_params.insert(
+                "path".to_string(),
+                json!(session_path.to_string_lossy().to_string()),
+            );
+        }
         let is_fresh_thread = self.fresh_thread_ids.remove(thread_id);
         let resume_result = if is_fresh_thread {
             // thread/start 创建的空任务无需 resume；部分 App Server 版本会在
@@ -1628,69 +2329,20 @@ impl AgentRuntime {
             }
             result
         };
-        if let Err(error) = resume_result {
-            if !is_active_writer_conflict(&error) {
-                return Err(error.into());
-            }
-            if !attachments.is_empty() {
-                return Err(RemoteAgentError::Attachment(
-                    "桌面端正在使用该任务时暂不支持通过手机发送附件".to_string(),
-                ));
-            }
-            self.send_execution_status(thread_id, "starting", "正在交由 Codex 桌面端发送")
-                .await?;
-            let desktop_thread_id = thread_id.to_string();
-            let desktop_text = text.clone();
-            let desktop_text_for_send = desktop_text.clone();
-            tokio::task::spawn_blocking(move || {
-                desktop_control::send_text_to_desktop_thread(&desktop_thread_id, &desktop_text_for_send)
-            })
-            .await
-            .map_err(|error| RemoteAgentError::Incompatible(format!("桌面端发送任务中断: {error}")))??;
-            // 先写入乐观消息；桌面端 JSONL 可能在 UI 提交后数秒才落盘。
-            self.pending_user_messages
-                .entry(thread_id.to_string())
-                .or_default()
-                .push(ConversationItemDto {
-                    id: format!("remote-pending-{}", Uuid::new_v4()),
-                    kind: ConversationKind::UserMessage,
-                    status: Some(ConversationStatus::Running),
-                    title: None,
-                    text: Some(desktop_text.clone()),
-                    detail: None,
-                    created_at: Some(unix_time_millis()),
-                    approval_request_id: None,
-                    approval_options: Vec::new(),
-                });
-            self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE).await?;
-            let mut confirmed = false;
-            for _ in 0..20 {
-                if load_local_thread_detail(thread_id).is_some_and(|(items, _, _, _)| {
-                    items.iter().any(|item| {
-                        matches!(item.kind, ConversationKind::UserMessage)
-                            && item.text.as_deref().is_some_and(|value| value.trim() == desktop_text.trim())
-                    })
-                }) {
-                    confirmed = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            if !confirmed {
-                self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE).await?;
-                return Err(RemoteAgentError::DesktopControl(DesktopControlError(
-                    "桌面端未确认消息已写入该会话".to_string(),
-                )));
-            }
-            self.send_execution_status(thread_id, "output", "已发送至 Codex 桌面端")
-                .await?;
-            self.send_snapshot_silent().await?;
-            self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE).await?;
-            return Ok(());
+        // Resume may be rejected because the desktop owns the current turn. The
+        // same app-server connection can still steer normal active turns without
+        // requiring the desktop window to be focused or unlocked.
+        match resume_result {
+            Ok(_) => {}
+            Err(error) if is_active_writer_conflict(&error) => {}
+            Err(error) => return Err(error.into()),
         }
         self.remote_turn_thread_ids.insert(thread_id.to_string());
 
         let mut input = Vec::new();
+        input.extend(skills.iter().map(|skill| {
+            json!({ "type": "skill", "name": skill.name, "path": skill.path })
+        }));
         if !text.trim().is_empty() {
             input.push(json!({ "type": "text", "text": text }));
         }
@@ -1714,25 +2366,217 @@ impl AgentRuntime {
         if let Some(effort) = &effort {
             turn_params.insert("effort".to_string(), json!(effort));
         }
+        if let Some(approval_policy) = approval_policy.clone() {
+            turn_params.insert("approvalPolicy".to_string(), approval_policy);
+        }
+        if let Some(sandbox_policy) = sandbox_policy.clone() {
+            turn_params.insert("sandboxPolicy".to_string(), sandbox_policy);
+        }
+        if let Some(mode) = collaboration_mode.as_deref() {
+            let mode_model = model
+                .clone()
+                .or_else(|| {
+                    self.thread_settings
+                        .get(thread_id)
+                        .and_then(|settings| settings.model.clone())
+                })
+                .or_else(|| {
+                    self.last_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| {
+                            snapshot
+                                .models
+                                .iter()
+                                .find(|model| model.is_default)
+                                .or_else(|| snapshot.models.first())
+                        })
+                        .map(|model| model.id.clone())
+                })
+                .ok_or_else(|| {
+                    RemoteAgentError::Incompatible(
+                        "计划模式缺少可用的模型".to_string(),
+                    )
+                })?;
+            let mut mode_settings = Map::new();
+            mode_settings.insert("model".to_string(), json!(mode_model));
+            if let Some(effort) = effort.clone() {
+                mode_settings.insert("reasoning_effort".to_string(), json!(effort));
+            }
+            turn_params.insert(
+                "collaborationMode".to_string(),
+                json!({ "mode": mode, "settings": Value::Object(mode_settings) }),
+            );
+        }
         if let Err(error) = self
             .app_server
             .request("turn/start", Value::Object(turn_params))
             .await
         {
-            self.remote_turn_thread_ids.remove(thread_id);
-            if self.remote_turn_thread_ids.is_empty() {
-                self.app_server_restart_requested = true;
+            self.release_thread_writer(thread_id).await;
+            if is_active_writer_conflict(&error) || is_active_turn_not_steerable(&error) {
+                self.queued_turn_messages.push(QueuedTurnMessage {
+                    id: Uuid::new_v4().to_string(),
+                    thread_id: thread_id.to_string(),
+                    text: text.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    approval_policy: approval_policy.clone(),
+                    sandbox_policy: sandbox_policy.clone(),
+                    collaboration_mode: collaboration_mode.clone(),
+                    skills: skills.clone(),
+                    attachments: attachments.clone(),
+                });
+                self.pending_user_messages
+                    .entry(thread_id.to_string())
+                    .or_default()
+                    .push(ConversationItemDto {
+                        id: format!("remote-pending-{}", Uuid::new_v4()),
+                        kind: ConversationKind::UserMessage,
+                        status: Some(ConversationStatus::Running),
+                        title: None,
+                        text: Some(text.clone()),
+                        detail: None,
+                        created_at: Some(unix_time_millis()),
+                        approval_request_id: None,
+                        approval_options: Vec::new(),
+                    });
+                self.send_execution_status(thread_id, "starting", "消息已排队，可从队列调整方向")
+                    .await?;
+                self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+                    .await?;
+                return Ok(());
             }
             return Err(error.into());
         }
-        self.thread_settings
-            .insert(thread_id.to_string(), ThreadSettings { model, effort });
+        let settings = self
+            .thread_settings
+            .entry(thread_id.to_string())
+            .or_insert(ThreadSettings {
+                model: None,
+                effort: None,
+                collaboration_mode: None,
+            });
+        if model.is_some() {
+            settings.model = model;
+        }
+        if effort.is_some() {
+            settings.effort = effort;
+        }
+        if collaboration_mode.is_some() {
+            settings.collaboration_mode = collaboration_mode;
+        }
         for (upload_id, _) in uploaded_attachments {
             self.uploaded_attachments.remove(&upload_id);
         }
         self.send_snapshot_silent().await?;
-        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
             .await
+    }
+
+
+    async fn queue_turn_message(&mut self, message: QueuedTurnMessage) -> Result<(), RemoteAgentError> {
+        let thread_id = message.thread_id.clone();
+        self.queued_turn_messages.push(message);
+        self.send_execution_status(&thread_id, "starting", "消息已加入队列")
+            .await?;
+        self.send_thread_detail(&thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+            .await
+    }
+
+    async fn steer_queued_turn(
+        &mut self,
+        thread_id: &str,
+        queue_id: &str,
+    ) -> Result<(), RemoteAgentError> {
+        let Some(index) = self
+            .queued_turn_messages
+            .iter()
+            .position(|message| message.thread_id == thread_id && message.id == queue_id)
+        else {
+            return Err(RemoteAgentError::ThreadNotFound(queue_id.to_string()));
+        };
+        let message = self.queued_turn_messages[index].clone();
+        let uploaded_attachments = message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                let uploaded = self
+                    .uploaded_attachments
+                    .get(&attachment.upload_id)
+                    .filter(|uploaded| {
+                        uploaded.name == attachment.name
+                            && uploaded.mime_type == attachment.mime_type
+                            && uploaded.size == attachment.size
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        RemoteAgentError::Attachment(format!(
+                            "附件 {} 尚未完成上传",
+                            attachment.name
+                        ))
+                    })?;
+                Ok((attachment.upload_id.clone(), uploaded))
+            })
+            .collect::<Result<Vec<_>, RemoteAgentError>>()?;
+
+        let mut input = Vec::new();
+        input.extend(message.skills.iter().map(|skill| {
+            json!({ "type": "skill", "name": skill.name, "path": skill.path })
+        }));
+        if !message.text.trim().is_empty() {
+            input.push(json!({ "type": "text", "text": message.text }));
+        }
+        input.extend(uploaded_attachments.iter().map(|(_, attachment)| {
+            let path = attachment.path.to_string_lossy();
+            if attachment.mime_type.starts_with("image/") {
+                json!({ "type": "localImage", "path": path })
+            } else if attachment.mime_type.starts_with("audio/") {
+                json!({ "type": "localAudio", "path": path })
+            } else {
+                json!({ "type": "mention", "name": attachment.name, "path": path })
+            }
+        }));
+        let expected_turn_id = self.find_active_turn_id(thread_id).await?;
+        self.app_server
+            .request(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": expected_turn_id,
+                    "input": input,
+                    "clientUserMessageId": message.id,
+                }),
+            )
+            .await?;
+        self.queued_turn_messages.remove(index);
+        for (upload_id, _) in uploaded_attachments {
+            self.uploaded_attachments.remove(&upload_id);
+        }
+        self.send_execution_status(thread_id, "thinking", "正在调整方向")
+            .await?;
+        self.send_snapshot_silent().await?;
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
+            .await
+    }
+
+
+    async fn flush_queued_turn_message(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
+        let Some(index) = self.queued_turn_messages.iter().position(|message| message.thread_id == thread_id) else {
+            return Ok(());
+        };
+        let message = self.queued_turn_messages.remove(index);
+        self.start_turn(
+            &message.thread_id,
+            message.text,
+            message.model,
+            message.effort,
+            message.approval_policy,
+            message.sandbox_policy,
+            message.collaboration_mode,
+            message.skills,
+            message.attachments,
+        )
+        .await
     }
 
     fn start_attachment_upload(
@@ -1827,7 +2671,7 @@ impl AgentRuntime {
             )
             .await?;
         self.send_snapshot_silent().await?;
-        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
             .await
     }
 
@@ -1869,7 +2713,7 @@ impl AgentRuntime {
             )
             .await?;
         self.send_snapshot_silent().await?;
-        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+        self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
             .await
     }
 
@@ -1904,7 +2748,7 @@ impl AgentRuntime {
     async fn refresh_current_view(&mut self) -> Result<(), RemoteAgentError> {
         self.send_snapshot_silent().await?;
         if let Some(thread_id) = self.last_detail_thread_id.clone() {
-            self.send_thread_detail(&thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+            self.send_thread_detail(&thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
                 .await?;
         }
         Ok(())
@@ -1915,7 +2759,7 @@ impl AgentRuntime {
         thread_id: &str,
     ) -> Result<(), RemoteAgentError> {
         if self.last_detail_thread_id.as_deref() == Some(thread_id) {
-            self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE)
+            self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
                 .await?;
         }
         Ok(())
@@ -1943,7 +2787,35 @@ impl AgentRuntime {
         self.app_server.shutdown().await;
         self.app_server = replacement;
         self.pending_approvals.clear();
+        self.detail_turn_cache = None;
         Ok(events)
+    }
+
+    fn cache_detail_turns(
+        &mut self,
+        thread_id: &str,
+        updated_at: i64,
+        turns: Vec<Vec<ConversationItemDto>>,
+    ) {
+        self.detail_turn_cache = Some(DetailTurnCache {
+            thread_id: thread_id.to_string(),
+            updated_at,
+            turns,
+        });
+    }
+
+    fn paginate_cached_detail(
+        &self,
+        thread_id: &str,
+        updated_at: i64,
+        before: usize,
+        limit: usize,
+    ) -> Option<(Vec<ConversationItemDto>, bool, Option<usize>)> {
+        let cache = self.detail_turn_cache.as_ref()?;
+        if cache.thread_id != thread_id || cache.updated_at != updated_at {
+            return None;
+        }
+        Some(paginate_conversation_turns(&cache.turns, before, limit))
     }
 }
 
@@ -2011,17 +2883,329 @@ fn load_local_thread_detail(
     Some((items, model, effort, context_usage))
 }
 
+#[cfg(test)]
 fn paginate_conversation_items(
     items: Vec<ConversationItemDto>,
     before: usize,
     limit: usize,
 ) -> (Vec<ConversationItemDto>, bool, Option<usize>) {
-    let end = items.len().saturating_sub(before);
+    let turns = group_conversation_items_into_turns(items);
+    paginate_conversation_turns(&turns, before, limit)
+}
+
+fn paginate_conversation_turns(
+    turns: &[Vec<ConversationItemDto>],
+    before: usize,
+    limit: usize,
+) -> (Vec<ConversationItemDto>, bool, Option<usize>) {
+    let end = turns.len().saturating_sub(before);
     let start = end.saturating_sub(limit);
     let page_length = end - start;
     let has_more_before = start > 0;
     let next_before = has_more_before.then_some(before.saturating_add(page_length));
-    (items.into_iter().skip(start).take(page_length).collect(), has_more_before, next_before)
+    let page = turns
+        .iter()
+        .skip(start)
+        .take(page_length)
+        .flat_map(|turn| turn.iter().cloned())
+        .collect();
+    (page, has_more_before, next_before)
+}
+
+fn group_conversation_items_into_turns(
+    items: Vec<ConversationItemDto>,
+) -> Vec<Vec<ConversationItemDto>> {
+    let mut turns: Vec<Vec<ConversationItemDto>> = Vec::new();
+    for item in items {
+        if turns.is_empty() || matches!(item.kind, ConversationKind::UserMessage) {
+            turns.push(Vec::new());
+        }
+        if let Some(turn) = turns.last_mut() {
+            turn.push(item);
+        }
+    }
+    turns
+}
+async fn build_model_catalog(
+    app_state: &AppState,
+) -> Result<(Option<String>, Vec<ModelDto>), RemoteAgentError> {
+    let providers = app_state
+        .db
+        .get_all_providers(AppType::Codex.as_str())
+        .map_err(|error| RemoteAgentError::Incompatible(error.to_string()))?;
+    let current_provider_id = app_state
+        .db
+        .get_current_provider(AppType::Codex.as_str())
+        .map_err(|error| RemoteAgentError::Incompatible(error.to_string()))?;
+    let mut groups = Vec::new();
+    for (provider_id, provider) in providers {
+        let (base_url, api_key) = provider.resolve_usage_credentials(&AppType::Codex);
+        if base_url.trim().is_empty() || api_key.trim().is_empty() {
+            continue;
+        }
+        let mut candidates = provider_model_candidates(&provider);
+        if candidates.len() < MAX_MODELS_PER_PROVIDER {
+            let is_full_url = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.is_full_url)
+                .unwrap_or(false);
+            let api_format = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.clone());
+            if let Ok(fetched) = model_fetch::fetch_models(
+                &base_url,
+                &api_key,
+                is_full_url,
+                None,
+                None,
+                api_format.as_deref(),
+                None,
+            )
+            .await
+            {
+                for model in fetched {
+                    if !candidates.iter().any(|candidate| candidate == &model.id) {
+                        candidates.push(model.id);
+                    }
+                    if candidates.len() >= MAX_MODELS_PER_PROVIDER {
+                        break;
+                    }
+                }
+            }
+        }
+        candidates.truncate(MAX_MODELS_PER_PROVIDER);
+        if candidates.is_empty() {
+            continue;
+        }
+        groups.push((
+            provider_id.clone(),
+            provider.name.clone(),
+            provider.icon.clone(),
+            base_url,
+            api_key,
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.clone()),
+            current_provider_id.as_deref() == Some(provider_id.as_str()),
+            candidates,
+        ));
+    }
+
+    let tasks = groups
+        .into_iter()
+        .map(
+            |(
+                provider_id,
+                provider_name,
+                provider_icon,
+                base_url,
+                api_key,
+                api_format,
+                current_provider,
+                candidates,
+            )| {
+                tokio::spawn(async move {
+                    let probes = candidates
+                        .into_iter()
+                        .map(|model_id| {
+                            let base_url = base_url.clone();
+                            let api_key = api_key.clone();
+                            let api_format = api_format.clone();
+                            tokio::spawn(async move {
+                                let available = probe_provider_model(
+                                    &base_url,
+                                    &api_key,
+                                    api_format.as_deref(),
+                                    &model_id,
+                                )
+                                .await;
+                                (model_id, available)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    join_all(probes)
+                        .await
+                        .into_iter()
+                        .filter_map(|result| result.ok())
+                        .filter(|(_, available)| *available)
+                        .map(|(model_id, _)| ModelDto {
+                            id: model_id.clone(),
+                            display_name: model_id,
+                            hidden: false,
+                            is_default: false,
+                            default_reasoning_effort: None,
+                            supported_reasoning_efforts: Vec::new(),
+                            provider_id: Some(provider_id.clone()),
+                            provider_name: Some(provider_name.clone()),
+                            provider_icon: provider_icon.clone(),
+                            current_provider,
+                        })
+                        .collect::<Vec<ModelDto>>()
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+    let results = join_all(tasks).await;
+    let mut models = Vec::new();
+    for result in results {
+        match result {
+            Ok(provider_models) => models.extend(provider_models),
+            Err(error) => log::warn!("Model catalog probe task failed: {error}"),
+        }
+    }
+    Ok((current_provider_id, models))
+}
+
+fn provider_model_candidates(provider: &Provider) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(config) = provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+    {
+        if let Ok(document) = config.parse::<toml_edit::DocumentMut>() {
+            if let Some(model) = document.get("model").and_then(|value| value.as_str()) {
+                let model = model.trim();
+                if !model.is_empty() {
+                    candidates.push(model.to_string());
+                }
+            }
+        }
+    }
+    if let Some(models) = provider
+        .settings_config
+        .pointer("/modelCatalog/models")
+        .and_then(Value::as_array)
+    {
+        for model in models {
+            let id = model
+                .get("model")
+                .and_then(Value::as_str)
+                .or_else(|| model.get("slug").and_then(Value::as_str))
+                .or_else(|| model.get("id").and_then(Value::as_str));
+            if let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) {
+                if !candidates.iter().any(|candidate| candidate == id) {
+                    candidates.push(id.to_string());
+                }
+            }
+            if candidates.len() >= MAX_MODELS_PER_PROVIDER {
+                break;
+            }
+        }
+    }
+    candidates
+}
+
+async fn probe_provider_model(
+    base_url: &str,
+    api_key: &str,
+    api_format: Option<&str>,
+    model_id: &str,
+) -> bool {
+    let chat_completions = matches!(
+        api_format,
+        Some("openai_chat" | "openai-completions" | "chat_completions")
+    );
+    let url = if chat_completions {
+        chat_completions_endpoint(base_url)
+    } else {
+        responses_endpoint(base_url)
+    };
+    let body = if chat_completions {
+        json!({
+            "model": model_id,
+            "messages": [{ "role": "user", "content": "Reply with OK." }],
+            "max_tokens": 16,
+            "stream": false,
+        })
+    } else {
+        json!({
+            "model": model_id,
+            "input": "Reply with OK.",
+            "max_output_tokens": 32,
+            "stream": false,
+            "store": false,
+        })
+    };
+    let request = crate::proxy::http_client::get()
+        .post(url)
+        .timeout(MODEL_PROBE_TIMEOUT)
+        .bearer_auth(api_key)
+        .json(&body);
+    let Ok(response) = request.send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let body = response.text().await.unwrap_or_default();
+    response_contains_text(&body)
+}
+
+fn responses_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/responses")
+    } else {
+        format!("{base}/v1/responses")
+    }
+}
+
+fn chat_completions_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
+fn response_contains_text(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return true;
+    };
+    if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return true;
+        }
+    }
+    if let Some(content) = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+    {
+        if !content.trim().is_empty() {
+            return true;
+        }
+    }
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        return output.iter().any(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+                || item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|part| {
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.trim().is_empty())
+                        })
+                    })
+        });
+    }
+    false
 }
 
 fn context_usage_from_notification(params: &Value) -> Option<ContextUsageDto> {
@@ -2068,6 +3252,20 @@ fn find_session_file_in(path: &Path, thread_id: &str) -> Option<PathBuf> {
     None
 }
 
+fn known_thread_revisions(threads: &[ThreadSummaryDto]) -> Vec<KnownThreadRevision> {
+    threads
+        .iter()
+        .map(|thread| KnownThreadRevision {
+            id: thread.id.clone(),
+            signature: thread_signature(thread),
+        })
+        .collect()
+}
+
+fn thread_signature(thread: &ThreadSummaryDto) -> String {
+    serde_json::to_string(thread).unwrap_or_default()
+}
+
 fn command_request_id(command: &RemoteCommand) -> Option<&str> {
     match command {
         RemoteCommand::Sync
@@ -2076,11 +3274,23 @@ fn command_request_id(command: &RemoteCommand) -> Option<&str> {
         RemoteCommand::ReadThread { request_id, .. }
         | RemoteCommand::CreateThread { request_id, .. }
         | RemoteCommand::StartTurn { request_id, .. }
+        | RemoteCommand::QueueTurn { request_id, .. }
+        | RemoteCommand::SteerQueuedTurn { request_id, .. }
         | RemoteCommand::StartAttachmentUpload { request_id, .. }
         | RemoteCommand::FinishAttachmentUpload { request_id, .. }
         | RemoteCommand::InterruptTurn { request_id, .. }
         | RemoteCommand::RespondApproval { request_id, .. }
-        | RemoteCommand::SetThreadPinned { request_id, .. } => request_id.as_deref(),
+        | RemoteCommand::SetThreadPinned { request_id, .. }
+        | RemoteCommand::ListSkills { request_id, .. }
+        | RemoteCommand::SetCollaborationMode { request_id, .. }
+        | RemoteCommand::SetThreadGoal { request_id, .. }
+        | RemoteCommand::ClearThreadGoal { request_id, .. }
+        | RemoteCommand::SetThreadName { request_id, .. }
+        | RemoteCommand::ArchiveThread { request_id, .. }
+        | RemoteCommand::DeleteThread { request_id, .. }
+        | RemoteCommand::CompactThread { request_id, .. }
+        | RemoteCommand::ListModels { request_id }
+        | RemoteCommand::SelectModel { request_id, .. } => request_id.as_deref(),
     }
 }
 
@@ -2089,6 +3299,15 @@ fn is_active_writer_conflict(error: &AppServerError) -> bool {
         error,
         AppServerError::Remote { message, .. }
             if message.contains("already has an active writer")
+    )
+}
+
+fn is_active_turn_not_steerable(error: &AppServerError) -> bool {
+    matches!(
+        error,
+        AppServerError::Remote { message, .. }
+            if message.contains("active turn cannot accept")
+                || message.contains("not steerable")
     )
 }
 
@@ -2413,6 +3632,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paginates_history_by_complete_user_agent_turns() {
+        let item = |kind: ConversationKind, text: &str| ConversationItemDto {
+            id: text.to_string(),
+            kind,
+            status: Some(ConversationStatus::Completed),
+            title: None,
+            text: Some(text.to_string()),
+            detail: None,
+            created_at: None,
+            approval_request_id: None,
+            approval_options: Vec::new(),
+        };
+        let items = vec![
+            item(ConversationKind::UserMessage, "u1"),
+            item(ConversationKind::AgentMessage, "a1"),
+            item(ConversationKind::UserMessage, "u2"),
+            item(ConversationKind::AgentMessage, "a2"),
+            item(ConversationKind::UserMessage, "u3"),
+            item(ConversationKind::AgentMessage, "a3"),
+        ];
+
+        let (latest, has_more, next_before) = paginate_conversation_items(items.clone(), 0, 2);
+        assert!(has_more);
+        assert_eq!(next_before, Some(2));
+        assert_eq!(
+            latest.iter().filter_map(|item| item.text.as_deref()).collect::<Vec<_>>(),
+            vec!["u2", "a2", "u3", "a3"]
+        );
+
+        let (older, has_more, next_before) =
+            paginate_conversation_items(items, next_before.expect("next cursor"), 2);
+        assert!(!has_more);
+        assert_eq!(next_before, None);
+        assert_eq!(
+            older.iter().filter_map(|item| item.text.as_deref()).collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+    }
+    #[test]
     fn normalizes_complete_conversation_without_dropping_unknown_items() {
         let turns = vec![RawTurn {
             id: "turn-1".to_string(),
@@ -2521,9 +3779,16 @@ mod tests {
     #[ignore = "requires the local Docker relay and a working Codex App Server"]
     async fn live_agent_relays_snapshot_and_thread_detail() {
         let access_key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let agent = RemoteControlAgent::start("ws://127.0.0.1/ws/agent", access_key.clone())
-            .await
-            .expect("start live Remote Agent");
+        let app_state = AppState::new(std::sync::Arc::new(
+            crate::database::Database::memory().expect("initialize in-memory database"),
+        ));
+        let agent = RemoteControlAgent::start(
+            "ws://127.0.0.1/ws/agent",
+            access_key.clone(),
+            app_state,
+        )
+        .await
+        .expect("start live Remote Agent");
 
         timeout(Duration::from_secs(15), async {
             while !agent.is_connected() {

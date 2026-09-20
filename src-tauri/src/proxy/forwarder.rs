@@ -1686,6 +1686,21 @@ impl RequestForwarder {
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
+        // 严格第三方 Responses 网关（new-api 系）要求 input 里的工具调用项必须带
+        // 非空 call_id，否则整包被 400 拒绝（missing field `call_id`）。Codex 在回放
+        // 部分工具历史时会省略该字段，这里在原生 Responses 出站前统一补齐。
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+        {
+            let patched = backfill_responses_input_call_ids(&mut request_body);
+            if patched > 0 {
+                log::warn!(
+                    "[Codex] Repaired {patched} tool-call item(s) in Responses input (provider={})",
+                    provider.id
+                );
+            }
+        }
         let mut filtered_body = prepare_upstream_request_body(request_body);
         if !is_copilot {
             if let Some(overrides) = provider
@@ -3734,6 +3749,139 @@ fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
     )
 }
 
+/// 是否为需要 `call_id` 的工具调用项。
+fn is_responses_tool_call_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str).unwrap_or(""),
+        "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call"
+    )
+}
+
+/// 是否为需要 `call_id` 的工具结果项。
+fn is_responses_tool_result_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str).unwrap_or(""),
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+    )
+}
+
+/// 读取 item 上非空的字符串 `call_id`。
+fn responses_item_call_id(item: &Value) -> Option<String> {
+    item.get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// 读取 item 上非空的字符串 `id`，作为回填 `call_id` 的兜底。
+fn responses_item_id(item: &Value) -> Option<String> {
+    item.get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// 在调用项之后、下一个调用项之前，取最近一个结果项自带的 `call_id`。
+fn nearest_following_output_call_id(items: &[Value], start: usize) -> Option<String> {
+    for item in items.iter().skip(start + 1) {
+        if is_responses_tool_call_item(item) {
+            return None;
+        }
+        if is_responses_tool_result_item(item) {
+            return responses_item_call_id(item);
+        }
+    }
+    None
+}
+
+/// 把孤立的工具结果项降级成一条 user message。
+///
+/// Codex 的心跳/定时任务会把要执行的指令作为单独的 `function_call_output` 注入
+/// （既没有 `call_id`，也没有对应调用）。严格网关会先报 missing field `call_id`，
+/// 补上后又报 No tool call found；直接转成 user message 最稳，也符合心跳
+/// “就是一条用户消息”的语义。
+fn orphan_tool_result_to_message(item: &Value) -> Value {
+    let content = match item.get("output") {
+        Some(Value::String(text)) => {
+            vec![serde_json::json!({ "type": "input_text", "text": text })]
+        }
+        Some(Value::Array(parts)) => parts.clone(),
+        Some(other) => vec![serde_json::json!({ "type": "input_text", "text": other.to_string() })],
+        None => vec![serde_json::json!({ "type": "input_text", "text": "" })],
+    };
+    serde_json::json!({ "type": "message", "role": "user", "content": content })
+}
+
+/// 严格第三方 Responses 网关（new-api 系）要求 `input` 里的工具调用与结果成对出现，
+/// 且两侧都带非空 `call_id`。Codex 在回放历史或注入心跳时会破坏这个前提，这里在
+/// 原生 Responses 出站前统一修复：缺 `call_id` 的回填，找不到调用的孤立结果
+/// 降级成 user message。
+fn backfill_responses_input_call_ids(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut patched = 0usize;
+    let mut generated = 0usize;
+
+    // 第一遍：补齐调用项的 call_id；缺 call_id 时优先采用其后最近结果项的 call_id。
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending: Vec<String> = Vec::new();
+    let call_indexes: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_responses_tool_call_item(item))
+        .map(|(index, _)| index)
+        .collect();
+    for index in call_indexes {
+        let call_id = responses_item_call_id(&items[index])
+            .or_else(|| nearest_following_output_call_id(items, index))
+            .or_else(|| responses_item_id(&items[index]))
+            .unwrap_or_else(|| {
+                generated += 1;
+                format!("call_ccswitch_{generated}")
+            });
+        if responses_item_call_id(&items[index]).is_none() {
+            if let Some(object) = items[index].as_object_mut() {
+                object.insert("call_id".to_string(), Value::String(call_id.clone()));
+                patched += 1;
+            }
+        }
+        if declared.insert(call_id.clone()) {
+            pending.push(call_id);
+        }
+    }
+
+    // 第二遍：结果项与尚未配对的调用配对；没有任何调用可配对的孤立结果降级成消息。
+    for index in 0..items.len() {
+        if !is_responses_tool_result_item(&items[index]) {
+            continue;
+        }
+        let existing = responses_item_call_id(&items[index]);
+        if let Some(call_id) = existing.as_ref() {
+            if declared.contains(call_id) {
+                pending.retain(|value| value != call_id);
+                continue;
+            }
+        }
+        if pending.is_empty() {
+            items[index] = orphan_tool_result_to_message(&items[index]);
+            patched += 1;
+            continue;
+        }
+        let call_id = pending.remove(0);
+        if responses_item_call_id(&items[index]).as_deref() != Some(call_id.as_str()) {
+            if let Some(object) = items[index].as_object_mut() {
+                object.insert("call_id".to_string(), Value::String(call_id));
+                patched += 1;
+            }
+        }
+    }
+
+    patched
+}
 fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }

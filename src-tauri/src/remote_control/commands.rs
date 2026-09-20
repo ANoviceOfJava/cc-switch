@@ -6,12 +6,14 @@ use uuid::Uuid;
 
 use super::agent::RemoteControlAgent;
 use super::config::{load_remote_control_config, save_remote_control_config, RemoteControlConfig};
+use crate::store::AppState;
 
 const ACCESS_KEY_MIN_LENGTH: usize = 32;
 const ACCESS_KEY_MAX_LENGTH: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct RemoteControlState {
+    app_state: AppState,
     runtime: Arc<Mutex<RemoteControlRuntime>>,
     operation: Arc<Mutex<()>>,
 }
@@ -51,12 +53,13 @@ enum RemoteControlStatus {
 
 impl RemoteControlState {
     /// 创建 Remote 状态容器，并读取当前电脑的独立配置文件。
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(app_state: AppState) -> Self {
         let (config, last_error) = match load_remote_control_config() {
             Ok(config) => (config, None),
             Err(error) => (RemoteControlConfig::default(), Some(error.to_string())),
         };
         Self {
+            app_state,
             runtime: Arc::new(Mutex::new(RemoteControlRuntime {
                 config,
                 agent: None,
@@ -112,7 +115,7 @@ impl RemoteControlState {
     }
 
     async fn start_agent(&self, config: RemoteControlConfig) {
-        match RemoteControlAgent::start(&config.relay_url, config.access_key.clone()).await {
+        match RemoteControlAgent::start(&config.relay_url, config.access_key.clone(), self.app_state.clone()).await {
             Ok(agent) => {
                 let mut runtime = self.runtime.lock().await;
                 runtime.agent = Some(agent);
