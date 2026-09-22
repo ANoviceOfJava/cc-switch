@@ -7170,7 +7170,7 @@ base_url = "https://production.api/v1"
     #[test]
     fn vendor_catalog_matched_model_keeps_vendor_modalities() {
         // A model that IS in the official catalog must keep the vendor's
-        // declared modalities (DeepSeek V4 now supports image input).
+        // declared modalities verbatim (deepseek-v4-pro is text-only there).
         let settings = json!({
             "modelCatalog": {
                 "models": [
@@ -7196,7 +7196,7 @@ base_url = "https://production.api/v1"
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(modalities, vec!["text", "image"]);
+        assert_eq!(modalities, vec!["text"]);
     }
 
     #[test]
