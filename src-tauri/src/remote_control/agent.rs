@@ -20,8 +20,8 @@ use super::project_state::{
     CodexProjectState, ProjectStateError,
 };
 use super::protocol::{
-    ApprovalDecision, KnownThreadRevision, ProtocolError, RemoteAttachment, RemoteCommand, RemoteSkill,
-    WireMessage,
+    ApprovalDecision, KnownThreadRevision, ProtocolError, RemoteAttachment, RemoteCommand,
+    RemoteSkill, WireMessage,
 };
 use super::relay_client::{RelayClient, RelayError, RelayEvent};
 use crate::app_config::AppType;
@@ -73,7 +73,6 @@ pub(crate) enum RemoteAgentError {
     Io(#[from] std::io::Error),
     #[error("附件数据不是有效 Base64: {0}")]
     Base64(#[from] base64::DecodeError),
-
 }
 
 pub(crate) struct RemoteControlAgent {
@@ -375,14 +374,12 @@ struct ReasoningEffortDto {
     description: Option<String>,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueuedMessageDto {
     id: String,
     text: String,
 }
-
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -626,7 +623,8 @@ impl AgentRuntime {
                 before,
                 limit,
             } => {
-                self.send_thread_detail(&thread_id, before, limit, read_request_id).await
+                self.send_thread_detail(&thread_id, before, limit, read_request_id)
+                    .await
             }
             RemoteCommand::CreateThread {
                 request_id,
@@ -736,23 +734,20 @@ impl AgentRuntime {
                 objective,
                 token_budget,
                 ..
-            } => self.set_thread_goal(&thread_id, objective, token_budget).await,
+            } => {
+                self.set_thread_goal(&thread_id, objective, token_budget)
+                    .await
+            }
             RemoteCommand::ClearThreadGoal { thread_id, .. } => {
                 self.clear_thread_goal(&thread_id).await
             }
             RemoteCommand::SetThreadName {
                 thread_id, name, ..
             } => self.set_thread_name(&thread_id, name).await,
-            RemoteCommand::ArchiveThread { thread_id, .. } => {
-                self.archive_thread(&thread_id).await
-            }
+            RemoteCommand::ArchiveThread { thread_id, .. } => self.archive_thread(&thread_id).await,
             RemoteCommand::DeleteThread { thread_id, .. } => self.delete_thread(&thread_id).await,
-            RemoteCommand::CompactThread { thread_id, .. } => {
-                self.compact_thread(&thread_id).await
-            }
-            RemoteCommand::ListModels { request_id } => {
-                self.send_model_catalog(request_id).await
-            }
+            RemoteCommand::CompactThread { thread_id, .. } => self.compact_thread(&thread_id).await,
+            RemoteCommand::ListModels { request_id } => self.send_model_catalog(request_id).await,
             RemoteCommand::SelectModel {
                 request_id,
                 provider_id,
@@ -1490,7 +1485,6 @@ impl AgentRuntime {
             .collect()
     }
 
-
     async fn send_model_catalog(
         &mut self,
         request_id: Option<String>,
@@ -1628,7 +1622,12 @@ impl AgentRuntime {
                 next_before: None,
                 queued_messages: self.queued_messages_for(thread_id),
             };
-            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone()).await?;
+            self.send_thread_detail_payload(
+                thread_id,
+                serde_json::to_value(detail)?,
+                request_id.clone(),
+            )
+            .await?;
             self.last_detail_thread_id = Some(thread_id.to_string());
             return Ok(());
         }
@@ -1644,7 +1643,8 @@ impl AgentRuntime {
                     items,
                     active_turn_id: None,
                     selected_model: settings.and_then(|settings| settings.model.clone()),
-                    selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+                    selected_reasoning_effort: settings
+                        .and_then(|settings| settings.effort.clone()),
                     collaboration_mode: settings
                         .and_then(|settings| settings.collaboration_mode.clone()),
                     goal: self.thread_goals.get(thread_id).cloned(),
@@ -1673,7 +1673,8 @@ impl AgentRuntime {
             let (items, has_more_before, next_before) =
                 paginate_conversation_turns(&turns, before, limit);
             if let Some(usage) = local_context_usage {
-                self.thread_context_usage.insert(thread_id.to_string(), usage);
+                self.thread_context_usage
+                    .insert(thread_id.to_string(), usage);
             }
             let settings = self.thread_settings.get(thread_id);
             let detail = ThreadDetailDto {
@@ -1696,8 +1697,12 @@ impl AgentRuntime {
                 next_before,
                 queued_messages: self.queued_messages_for(thread_id),
             };
-            self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone())
-                .await?;
+            self.send_thread_detail_payload(
+                thread_id,
+                serde_json::to_value(detail)?,
+                request_id.clone(),
+            )
+            .await?;
             self.last_detail_thread_id = Some(thread_id.to_string());
             return Ok(());
         }
@@ -1734,7 +1739,8 @@ impl AgentRuntime {
                     items,
                     active_turn_id: None,
                     selected_model: settings.and_then(|settings| settings.model.clone()),
-                    selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
+                    selected_reasoning_effort: settings
+                        .and_then(|settings| settings.effort.clone()),
                     collaboration_mode: settings
                         .and_then(|settings| settings.collaboration_mode.clone()),
                     goal: self.thread_goals.get(thread_id).cloned(),
@@ -1742,9 +1748,14 @@ impl AgentRuntime {
                     before,
                     has_more_before: false,
                     next_before: None,
-                        queued_messages: self.queued_messages_for(thread_id),
+                    queued_messages: self.queued_messages_for(thread_id),
                 };
-                self.send_thread_detail_payload(thread_id, serde_json::to_value(detail)?, request_id.clone()).await?;
+                self.send_thread_detail_payload(
+                    thread_id,
+                    serde_json::to_value(detail)?,
+                    request_id.clone(),
+                )
+                .await?;
                 self.last_detail_thread_id = Some(thread_id.to_string());
                 return Ok(());
             }
@@ -1789,8 +1800,7 @@ impl AgentRuntime {
             active_turn_id,
             selected_model: settings.and_then(|settings| settings.model.clone()),
             selected_reasoning_effort: settings.and_then(|settings| settings.effort.clone()),
-            collaboration_mode: settings
-                .and_then(|settings| settings.collaboration_mode.clone()),
+            collaboration_mode: settings.and_then(|settings| settings.collaboration_mode.clone()),
             goal: self.thread_goals.get(thread_id).cloned(),
             context_usage: self.thread_context_usage.get(thread_id).copied(),
             before,
@@ -1799,7 +1809,8 @@ impl AgentRuntime {
             queued_messages: self.queued_messages_for(thread_id),
         };
         let payload = serde_json::to_value(detail)?;
-        self.send_thread_detail_payload(thread_id, payload, request_id.clone()).await?;
+        self.send_thread_detail_payload(thread_id, payload, request_id.clone())
+            .await?;
         self.last_detail_thread_id = Some(thread_id.to_string());
         Ok(())
     }
@@ -1825,7 +1836,8 @@ impl AgentRuntime {
         });
         items.extend(pending.iter().cloned());
         if !pending.is_empty() {
-            self.pending_user_messages.insert(thread_id.to_string(), pending);
+            self.pending_user_messages
+                .insert(thread_id.to_string(), pending);
         }
         items
     }
@@ -1839,7 +1851,11 @@ impl AgentRuntime {
         let encoded = serde_json::to_string(&payload)?;
         if encoded.chars().count() <= DETAIL_CHUNK_CHARS {
             self.relay
-                .send(WireMessage::outbound("thread.detail", request_id.clone(), Some(payload))?)
+                .send(WireMessage::outbound(
+                    "thread.detail",
+                    request_id.clone(),
+                    Some(payload),
+                )?)
                 .await?;
             return Ok(());
         }
@@ -1949,7 +1965,10 @@ impl AgentRuntime {
                 pinned: false,
                 id: thread_id.to_string(),
                 project_id: Some(project_id.to_string()),
-                name: thread_value.get("name").and_then(Value::as_str).map(str::to_string),
+                name: thread_value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 preview: thread_value
                     .get("preview")
                     .and_then(Value::as_str)
@@ -1998,10 +2017,12 @@ impl AgentRuntime {
         // 远程 Agent 与桌面端 UI 使用不同的刷新通道；唤起新任务可让桌面端
         // 立即重新加载任务列表并显示刚创建的会话。
         let desktop_thread_id = thread_id.to_string();
-        tokio::task::spawn_blocking(move || desktop_control::show_desktop_thread(&desktop_thread_id))
-            .await
-            .map_err(|error| RemoteAgentError::Incompatible(format!("桌面端刷新任务中断: {error}")))?
-            .ok();
+        tokio::task::spawn_blocking(move || {
+            desktop_control::show_desktop_thread(&desktop_thread_id)
+        })
+        .await
+        .map_err(|error| RemoteAgentError::Incompatible(format!("桌面端刷新任务中断: {error}")))?
+        .ok();
         Ok(())
     }
 
@@ -2082,7 +2103,13 @@ impl AgentRuntime {
                 .as_deref()
                 .unwrap_or(&left.name)
                 .to_lowercase()
-                .cmp(&right.display_name.as_deref().unwrap_or(&right.name).to_lowercase())
+                .cmp(
+                    &right
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(&right.name)
+                        .to_lowercase(),
+                )
         });
         self.relay
             .send(WireMessage::outbound(
@@ -2118,9 +2145,7 @@ impl AgentRuntime {
                     })
                     .map(|model| model.id.clone())
             })
-            .ok_or_else(|| {
-                RemoteAgentError::Incompatible("计划模式缺少可用的模型".to_string())
-            })?;
+            .ok_or_else(|| RemoteAgentError::Incompatible("计划模式缺少可用的模型".to_string()))?;
         let effort = self
             .thread_settings
             .get(thread_id)
@@ -2176,11 +2201,10 @@ impl AgentRuntime {
                 }),
             )
             .await?;
-        let goal: ThreadGoalDto = serde_json::from_value(
-            response.get("goal").cloned().ok_or_else(|| {
+        let goal: ThreadGoalDto =
+            serde_json::from_value(response.get("goal").cloned().ok_or_else(|| {
                 RemoteAgentError::Incompatible("thread/goal/set 缺少 goal".to_string())
-            })?,
-        )?;
+            })?)?;
         self.thread_goals.insert(thread_id.to_string(), goal);
         self.send_thread_detail(thread_id, 0, THREAD_DETAIL_PAGE_SIZE, None)
             .await
@@ -2340,9 +2364,11 @@ impl AgentRuntime {
         self.remote_turn_thread_ids.insert(thread_id.to_string());
 
         let mut input = Vec::new();
-        input.extend(skills.iter().map(|skill| {
-            json!({ "type": "skill", "name": skill.name, "path": skill.path })
-        }));
+        input.extend(
+            skills
+                .iter()
+                .map(|skill| json!({ "type": "skill", "name": skill.name, "path": skill.path })),
+        );
         if !text.trim().is_empty() {
             input.push(json!({ "type": "text", "text": text }));
         }
@@ -2393,9 +2419,7 @@ impl AgentRuntime {
                         .map(|model| model.id.clone())
                 })
                 .ok_or_else(|| {
-                    RemoteAgentError::Incompatible(
-                        "计划模式缺少可用的模型".to_string(),
-                    )
+                    RemoteAgentError::Incompatible("计划模式缺少可用的模型".to_string())
                 })?;
             let mut mode_settings = Map::new();
             mode_settings.insert("model".to_string(), json!(mode_model));
@@ -2448,14 +2472,14 @@ impl AgentRuntime {
             }
             return Err(error.into());
         }
-        let settings = self
-            .thread_settings
-            .entry(thread_id.to_string())
-            .or_insert(ThreadSettings {
-                model: None,
-                effort: None,
-                collaboration_mode: None,
-            });
+        let settings =
+            self.thread_settings
+                .entry(thread_id.to_string())
+                .or_insert(ThreadSettings {
+                    model: None,
+                    effort: None,
+                    collaboration_mode: None,
+                });
         if model.is_some() {
             settings.model = model;
         }
@@ -2473,8 +2497,10 @@ impl AgentRuntime {
             .await
     }
 
-
-    async fn queue_turn_message(&mut self, message: QueuedTurnMessage) -> Result<(), RemoteAgentError> {
+    async fn queue_turn_message(
+        &mut self,
+        message: QueuedTurnMessage,
+    ) -> Result<(), RemoteAgentError> {
         let thread_id = message.thread_id.clone();
         self.queued_turn_messages.push(message);
         self.send_execution_status(&thread_id, "starting", "消息已加入队列")
@@ -2520,9 +2546,12 @@ impl AgentRuntime {
             .collect::<Result<Vec<_>, RemoteAgentError>>()?;
 
         let mut input = Vec::new();
-        input.extend(message.skills.iter().map(|skill| {
-            json!({ "type": "skill", "name": skill.name, "path": skill.path })
-        }));
+        input.extend(
+            message
+                .skills
+                .iter()
+                .map(|skill| json!({ "type": "skill", "name": skill.name, "path": skill.path })),
+        );
         if !message.text.trim().is_empty() {
             input.push(json!({ "type": "text", "text": message.text }));
         }
@@ -2559,9 +2588,12 @@ impl AgentRuntime {
             .await
     }
 
-
     async fn flush_queued_turn_message(&mut self, thread_id: &str) -> Result<(), RemoteAgentError> {
-        let Some(index) = self.queued_turn_messages.iter().position(|message| message.thread_id == thread_id) else {
+        let Some(index) = self
+            .queued_turn_messages
+            .iter()
+            .position(|message| message.thread_id == thread_id)
+        else {
             return Ok(());
         };
         let message = self.queued_turn_messages.remove(index);
@@ -3657,7 +3689,10 @@ mod tests {
         assert!(has_more);
         assert_eq!(next_before, Some(2));
         assert_eq!(
-            latest.iter().filter_map(|item| item.text.as_deref()).collect::<Vec<_>>(),
+            latest
+                .iter()
+                .filter_map(|item| item.text.as_deref())
+                .collect::<Vec<_>>(),
             vec!["u2", "a2", "u3", "a3"]
         );
 
@@ -3666,7 +3701,10 @@ mod tests {
         assert!(!has_more);
         assert_eq!(next_before, None);
         assert_eq!(
-            older.iter().filter_map(|item| item.text.as_deref()).collect::<Vec<_>>(),
+            older
+                .iter()
+                .filter_map(|item| item.text.as_deref())
+                .collect::<Vec<_>>(),
             vec!["u1", "a1"]
         );
     }
@@ -3782,13 +3820,10 @@ mod tests {
         let app_state = AppState::new(std::sync::Arc::new(
             crate::database::Database::memory().expect("initialize in-memory database"),
         ));
-        let agent = RemoteControlAgent::start(
-            "ws://127.0.0.1/ws/agent",
-            access_key.clone(),
-            app_state,
-        )
-        .await
-        .expect("start live Remote Agent");
+        let agent =
+            RemoteControlAgent::start("ws://127.0.0.1/ws/agent", access_key.clone(), app_state)
+                .await
+                .expect("start live Remote Agent");
 
         timeout(Duration::from_secs(15), async {
             while !agent.is_connected() {

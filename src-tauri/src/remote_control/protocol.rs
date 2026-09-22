@@ -518,7 +518,9 @@ impl RemoteCommand {
             }
             "turn.queue" => {
                 let payload: StartTurnPayload = parse_payload(payload)?;
-                let queue_id = payload.queue_id.ok_or_else(|| ProtocolError::InvalidPayload("queueId".to_string()))?;
+                let queue_id = payload
+                    .queue_id
+                    .ok_or_else(|| ProtocolError::InvalidPayload("queueId".to_string()))?;
                 validate_identifier("queueId", &queue_id)?;
                 validate_identifier("threadId", &payload.thread_id)?;
                 if payload.attachments.len() > MAX_ATTACHMENTS_PER_TURN {
@@ -534,7 +536,11 @@ impl RemoteCommand {
                 }
                 validate_optional_identifier("model", payload.model.as_deref())?;
                 validate_optional_identifier("effort", payload.effort.as_deref())?;
-                validate_optional_policy("approvalPolicy", payload.approval_policy.as_ref(), &["untrusted", "on-request", "never"])?;
+                validate_optional_policy(
+                    "approvalPolicy",
+                    payload.approval_policy.as_ref(),
+                    &["untrusted", "on-request", "never"],
+                )?;
                 validate_sandbox_policy(payload.sandbox_policy.as_ref())?;
                 validate_collaboration_mode(payload.collaboration_mode.as_deref())?;
                 validate_skills(&payload.skills)?;
@@ -634,7 +640,9 @@ impl RemoteCommand {
                 validate_optional_identifier("threadId", payload.thread_id.as_deref())?;
                 validate_optional_identifier("projectId", payload.project_id.as_deref())?;
                 if payload.thread_id.is_none() && payload.project_id.is_none() {
-                    return Err(ProtocolError::InvalidPayload("threadId/projectId".to_string()));
+                    return Err(ProtocolError::InvalidPayload(
+                        "threadId/projectId".to_string(),
+                    ));
                 }
                 Ok(Self::ListSkills {
                     request_id: message.request_id,

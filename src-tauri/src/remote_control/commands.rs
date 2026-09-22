@@ -115,7 +115,13 @@ impl RemoteControlState {
     }
 
     async fn start_agent(&self, config: RemoteControlConfig) {
-        match RemoteControlAgent::start(&config.relay_url, config.access_key.clone(), self.app_state.clone()).await {
+        match RemoteControlAgent::start(
+            &config.relay_url,
+            config.access_key.clone(),
+            self.app_state.clone(),
+        )
+        .await
+        {
             Ok(agent) => {
                 let mut runtime = self.runtime.lock().await;
                 runtime.agent = Some(agent);
