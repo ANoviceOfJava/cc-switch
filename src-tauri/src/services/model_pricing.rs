@@ -303,6 +303,11 @@ pub fn sync_local_model_pricing(db: &Database) -> Result<usize, AppError> {
         apply_file_to_database(db, &file)?
     };
 
+    // 本地覆盖文件可能残留旧的 models.dev 快照价（如 DeepSeek V4 调价前的
+    // 0.435/0.87），应用后会覆盖内置价。这里在回填历史成本前再跑一次内置价修复，
+    // 只改仍等于已知旧值的行，不会重新插入被用户删除的模型。
+    db.repair_model_pricing_seeded()?;
+
     // Deleting pricing cannot make a zero-cost usage row calculable. In
     // particular, seeded rows covered by tombstones may be reinserted and
     // deleted on every startup; they must not trigger a full-table backfill.

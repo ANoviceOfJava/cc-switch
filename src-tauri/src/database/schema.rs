@@ -3403,6 +3403,33 @@ impl Database {
                 "0.006",
                 "0",
             ),
+            // models.dev 早期快照把 deepseek-flash 录成了 0.3/1/0.3/0.375，且旧版
+            // vision-exp 快照仍是 V4 Flash 调价前的 0.14/0.28/0.0028；这些覆盖文件会
+            // 在每次启动时盖过内置价，因此与上方 DeepSeek 条目一样补 repair 守卫。
+            (
+                "deepseek-flash",
+                "DeepSeek V4.1 Flash",
+                "0.3",
+                "1.2",
+                "0.006",
+                "0",
+                "0.3",
+                "1",
+                "0.3",
+                "0.375",
+            ),
+            (
+                "deepseek-v4-flash-vision-exp",
+                "DeepSeek V4 Flash Vision Exp",
+                "0.3",
+                "1.2",
+                "0.006",
+                "0",
+                "0.14",
+                "0.28",
+                "0.0028",
+                "0",
+            ),
         ];
 
         for (
@@ -3459,6 +3486,12 @@ impl Database {
         // 每次启动都执行 INSERT OR IGNORE，增量追加新模型；仅修复仍等于旧内置值的定价。
         Self::seed_model_pricing(conn)?;
         Self::repair_current_model_pricing(conn)
+    }
+
+    /// 仅修复仍等于旧内置值的定价，不重新插入已被用户删除的行。
+    pub(crate) fn repair_model_pricing_seeded(&self) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        Self::repair_current_model_pricing(&conn)
     }
 
     // --- 辅助方法 ---
