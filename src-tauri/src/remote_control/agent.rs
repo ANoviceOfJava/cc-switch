@@ -1285,6 +1285,8 @@ impl AgentRuntime {
             all.extend(page.data);
 
             let Some(next_cursor) = page.next_cursor else {
+                let mut seen = HashSet::new();
+                all.retain(|thread| seen.insert(thread.id.clone()));
                 return Ok(all);
             };
             if !seen_cursors.insert(next_cursor.clone()) {
@@ -1422,6 +1424,8 @@ impl AgentRuntime {
             all.extend(page.data);
 
             let Some(next_cursor) = page.next_cursor else {
+                let mut seen = HashSet::new();
+                all.retain(|thread| seen.insert(thread.id.clone()));
                 return Ok(all);
             };
             if !seen_cursors.insert(next_cursor.clone()) {
