@@ -2319,15 +2319,9 @@ impl AgentRuntime {
                 resume_params.insert("cwd".to_string(), json!(summary.cwd));
             }
         }
-        // App Server 的索引可能在重启或迁移后暂时丢失，但 rollout 文件仍在。
-        // 指定 path 可以直接从本地会话恢复，避免手机端继续使用旧任务时报
-        // “thread not found”。
-        if let Some(session_path) = find_session_file(&session_roots(), thread_id) {
-            resume_params.insert(
-                "path".to_string(),
-                json!(session_path.to_string_lossy().to_string()),
-            );
-        }
+        // 分页线程可能由多个 rollout 文件组成，本地遍历找到的 path 未必是
+        // App Server 当前使用的续写文件；带 path 恢复会触发 stale path 错误。
+        // 始终优先按 threadId 恢复，由 App Server 自行选择当前 rollout。
         let is_fresh_thread = self.fresh_thread_ids.remove(thread_id);
         let resume_result = if is_fresh_thread {
             // thread/start 创建的空任务无需 resume；部分 App Server 版本会在
